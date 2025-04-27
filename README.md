@@ -9,3 +9,6 @@ https://stackoverflow.com/questions/753954/how-to-program-a-neural-network-for-c
 
 https://medium.com/data-science/train-your-own-chess-ai-66b9ca8d71e4
 
+
+Data is on
+https://database.nikonoel.fr/
