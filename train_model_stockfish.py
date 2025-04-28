@@ -483,7 +483,7 @@ if __name__ == "__main__":
     data_dir = "data"
     if os.path.exists(data_dir):
         print(f"Training from PGN data in directory: {data_dir}")
-        trainer.train_from_pgn(data_dir, num_games=500)
+        trainer.train_from_pgn(data_dir, num_games=5000)
     else:
         print(f"Data directory not found: {data_dir}")
     
