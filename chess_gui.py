@@ -245,7 +245,7 @@ class ChessGUI:
         # If a model is loaded, use it to make a move
         if self.model:
             try:
-                # This is a placeholder - you'll need to implement the actual model integration
+               
                 move = self.get_model_move()
             except Exception as e:
                 messagebox.showerror("Error", f"Error getting move from model: {str(e)}")
@@ -259,8 +259,19 @@ class ChessGUI:
     def get_model_move(self):
         """Get a move from the loaded model"""
         if self.model:
-            return self.model_integration.get_move(self.board)
+            try:
+                return self.model_integration.get_move(self.board)
+            except Exception as e:
+                print(f"Error getting move from model: {str(e)}")
+                # Fall back to random move if there's an error
+                return random.choice(list(self.board.legal_moves))
         else:
+            # Prompt user to load a model if none is loaded
+            if messagebox.askyesno("No Model Loaded", "No chess model is currently loaded. Would you like to load one now?"):
+                self.load_model()
+                if self.model:
+                    return self.model_integration.get_move(self.board)
+            # Fall back to random move
             return random.choice(list(self.board.legal_moves))
 
     def load_model(self):
