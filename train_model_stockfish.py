@@ -487,9 +487,13 @@ class ChessTrainerWithStockfish:
                 board_fen = board.fen().split(' ')[0]  # Just the piece positions
                 if board_fen in positions_seen:
                     positions_seen[board_fen] += 1
-                    if positions_seen[board_fen] >= 3:
-                        # Penalize repetition
-                        reward -= 0.5
+                    # Apply increasingly severe penalties for repetitions
+                    if positions_seen[board_fen] == 2:
+                        # Second occurrence (first repetition)
+                        reward -= 1.0
+                    elif positions_seen[board_fen] >= 3:
+                        # Third occurrence (threefold repetition)
+                        reward -= 3.0
                         done = True  # End the game to avoid infinite loops
                 else:
                     positions_seen[board_fen] = 1

@@ -26,7 +26,21 @@ This guide provides detailed instructions for using the Karry_Gasparov chess AI 
    - `model_pgn_final.pt`: Model trained on PGN data
    - `model_improved_final.pt`: Model with enhanced training (if available)
 
-3. After loading the model, you can play against it by making your move and then clicking the "AI Move" button.
+3. Set the repetition penalty value in the dialog that appears:
+   - Lower values (0.1-0.5): Strong penalty, AI will strongly avoid repetitions
+   - Medium values (0.6-0.8): Moderate penalty, recommended for balanced play
+   - Higher values (0.9): Weak penalty, AI may still make repetitive moves
+
+4. After loading the model, you can play against it by making your move and then clicking the "AI Move" button.
+
+### Repetition Avoidance
+
+The AI has a built-in repetition avoidance mechanism to prevent it from making repetitive moves that could lead to draws. This is controlled by the repetition penalty parameter:
+
+- The AI tracks all positions it has encountered during the game
+- When considering moves, it applies penalties to moves that would lead to repeated positions
+- The penalties increase with each repetition, making threefold repetition very unlikely
+- You can adjust the strength of this penalty when loading a model
 
 ### GUI Controls
 

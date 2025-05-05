@@ -37,9 +37,11 @@ class RandomModel:
 
 class DRLChessModel:
     """Wrapper for the deep reinforcement learning chess model"""
-    def __init__(self, model_path=None):
+    def __init__(self, model_path=None, repetition_penalty=0.8):
         self.name = "Deep Reinforcement Learning Chess Bot"
-        self.agent = ChessAgent(model_path=model_path)
+
+        # Create agent with repetition avoidance
+        self.agent = ChessAgent(model_path=model_path, repetition_penalty=repetition_penalty)
 
         # If model_path is provided but doesn't exist, print a warning
         if model_path and not os.path.exists(model_path):
@@ -64,12 +66,13 @@ class ModelIntegration:
         """Initialize with a random model as default"""
         self.current_model = RandomModel()
 
-    def load_model(self, model_path):
+    def load_model(self, model_path, repetition_penalty=0.8):
         """
         Load a chess model from a file.
 
         Args:
             model_path (str): Path to the model file
+            repetition_penalty (float, optional): Penalty factor for repeated positions (0-1)
 
         Returns:
             The loaded model object
@@ -84,8 +87,8 @@ class ModelIntegration:
         if model_path.endswith('.pt') or model_path.endswith('.pth'):
             # PyTorch model (our DRL model)
             try:
-                self.current_model = DRLChessModel(model_path=model_path)
-                print(f"Loaded DRL model from {model_path}")
+                self.current_model = DRLChessModel(model_path=model_path, repetition_penalty=repetition_penalty)
+                print(f"Loaded DRL model from {model_path} with repetition penalty {repetition_penalty}")
                 return self.current_model
             except Exception as e:
                 print(f"Error loading DRL model: {str(e)}")

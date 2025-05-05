@@ -162,14 +162,16 @@ class ChessAgent:
     objects and the tensor representation needed by the neural network.
 
     The agent also handles special cases like promotions and ensures that
-    only legal moves are selected.
+    only legal moves are selected. It includes repetition detection and avoidance
+    to prevent the agent from making repetitive moves that could lead to draws.
     """
-    def __init__(self, model_path=None):
+    def __init__(self, model_path=None, repetition_penalty=0.95):
         """
         Initialize the chess agent with an optional pre-trained model.
 
         Args:
             model_path (str, optional): Path to a saved model file (.pt or .pth)
+            repetition_penalty (float, optional): Penalty factor for repeated positions (0-1)
         """
         # Initialize the policy network
         self.policy_net = DQN()
@@ -181,6 +183,13 @@ class ChessAgent:
 
         # Set to evaluation mode (no gradient tracking needed for inference)
         self.policy_net.eval()
+
+        # Position history tracking for repetition detection
+        self.position_history = {}
+
+        # Penalty factor for repeated positions (0-1)
+        # Lower values = stronger penalty
+        self.repetition_penalty = repetition_penalty
 
     def select_move(self, board):
         """
@@ -196,9 +205,10 @@ class ChessAgent:
         1. Converts the board to a tensor representation
         2. Creates a mask of legal moves
         3. Gets Q-values from the policy network
-        4. Selects the move with the highest Q-value
-        5. Handles special cases like promotions
-        6. Ensures the selected move is legal
+        4. Applies penalties for moves that lead to repeated positions
+        5. Selects the move with the highest adjusted Q-value
+        6. Handles special cases like promotions
+        7. Ensures the selected move is legal
         """
         with torch.no_grad():  # No need to track gradients for inference
             # Convert board to tensor representation
@@ -208,8 +218,11 @@ class ChessAgent:
             # Get Q-values for all moves from the policy network
             q_values = self.policy_net(state_tensor, move_mask)
 
-            # Select the move with the highest Q-value
-            best_move_index = torch.argmax(q_values).item()
+            # Apply repetition avoidance by penalizing moves that lead to repeated positions
+            adjusted_q_values = self._apply_repetition_penalties(board, q_values.clone())
+
+            # Select the move with the highest adjusted Q-value
+            best_move_index = torch.argmax(adjusted_q_values).item()
 
             # Convert index to chess move coordinates
             from_square = best_move_index // 64
@@ -228,6 +241,8 @@ class ChessAgent:
                      potential_move.promotion = chess.QUEEN
 
             if potential_move in board.legal_moves:
+                # Update position history with the selected move
+                self._update_position_history(board, potential_move)
                 return potential_move
             else:
                 # Fallback: if the predicted best move isn't legal (e.g., mask issue),
@@ -251,10 +266,80 @@ class ChessAgent:
                          potential_move.promotion = chess.QUEEN
 
                 if potential_move in board.legal_moves:
+                     # Update position history with the selected move
+                     self._update_position_history(board, potential_move)
                      return potential_move
                 else:
                      print("Fallback failed, choosing random legal move.")
-                     return random.choice(list(board.legal_moves))
+                     # Choose a random move and update position history
+                     random_move = random.choice(list(board.legal_moves))
+                     self._update_position_history(board, random_move)
+                     return random_move
+
+    def _apply_repetition_penalties(self, board, q_values):
+        """
+        Apply penalties to Q-values for moves that lead to repeated positions.
+
+        Args:
+            board (chess.Board): The current chess position
+            q_values (torch.Tensor): Q-values from the policy network
+
+        Returns:
+            torch.Tensor: Adjusted Q-values with repetition penalties applied
+        """
+        # Get all legal moves
+        legal_moves = list(board.legal_moves)
+
+        # For each legal move, check if it leads to a repeated position
+        for move in legal_moves:
+            # Create a copy of the board to simulate the move
+            board_copy = board.copy()
+            board_copy.push(move)
+
+            # Get the position FEN (just the piece positions, not the full FEN)
+            position_fen = board_copy.fen().split(' ')[0]
+
+            # Calculate move index
+            move_idx = move.from_square * 64 + move.to_square
+
+            # Apply penalty based on how many times this position has been seen
+            if position_fen in self.position_history:
+                # Get the number of times this position has been seen
+                repetition_count = self.position_history[position_fen]
+
+                # Apply increasingly severe penalties for repeated positions
+                if repetition_count == 1:
+                    # First repetition: mild penalty
+                    q_values[0, move_idx] *= self.repetition_penalty
+                elif repetition_count == 2:
+                    # Second repetition (would be a threefold repetition): severe penalty
+                    q_values[0, move_idx] *= (self.repetition_penalty ** 2)
+                else:
+                    # More than two repetitions: extreme penalty
+                    q_values[0, move_idx] *= (self.repetition_penalty ** 3)
+
+        return q_values
+
+    def _update_position_history(self, board, move):
+        """
+        Update the position history after making a move.
+
+        Args:
+            board (chess.Board): The current chess position
+            move (chess.Move): The move to be made
+        """
+        # Create a copy of the board to simulate the move
+        board_copy = board.copy()
+        board_copy.push(move)
+
+        # Get the position FEN (just the piece positions, not the full FEN)
+        position_fen = board_copy.fen().split(' ')[0]
+
+        # Update the position history
+        if position_fen in self.position_history:
+            self.position_history[position_fen] += 1
+        else:
+            self.position_history[position_fen] = 1
 
 # --- Training components (to be added later) ---
 # Replay Memory
