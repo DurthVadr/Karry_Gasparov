@@ -1,3 +1,21 @@
+"""
+Model Integration Module
+
+This module provides an interface between the chess GUI and various chess models.
+It handles loading different types of models and provides a consistent interface
+for getting moves from them.
+
+The main components are:
+1. RandomModel: A fallback model that makes random legal moves
+2. DRLChessModel: A wrapper for the deep reinforcement learning chess model
+3. ModelIntegration: The main class that handles loading and using models
+
+Usage:
+    model_integration = ModelIntegration()
+    model = model_integration.load_model("path/to/model.pt")
+    move = model.get_move(board)
+"""
+
 import chess
 import random
 import os
@@ -32,12 +50,36 @@ class DRLChessModel:
         return self.agent.select_move(board)
 
 class ModelIntegration:
-    """Class to handle integration with different chess models"""
+    """
+    Handles integration between the chess GUI and various chess models.
+
+    This class provides a unified interface for loading and using different types
+    of chess models. It supports loading PyTorch models (.pt, .pth) and provides
+    a fallback to a random move generator if loading fails.
+
+    Attributes:
+        current_model: The currently loaded chess model
+    """
     def __init__(self):
+        """Initialize with a random model as default"""
         self.current_model = RandomModel()
 
     def load_model(self, model_path):
-        """Load a model from a file"""
+        """
+        Load a chess model from a file.
+
+        Args:
+            model_path (str): Path to the model file
+
+        Returns:
+            The loaded model object
+
+        The method determines the model type based on the file extension:
+        - .pt/.pth: PyTorch models (DRL chess model)
+        - .h5: TensorFlow/Keras models (not currently supported)
+
+        If loading fails, it falls back to a random model.
+        """
         # Check file extension to determine model type
         if model_path.endswith('.pt') or model_path.endswith('.pth'):
             # PyTorch model (our DRL model)
@@ -64,5 +106,13 @@ class ModelIntegration:
             return self.current_model
 
     def get_move(self, board):
-        """Get a move from the current model"""
+        """
+        Get a move from the current model for the given board position.
+
+        Args:
+            board (chess.Board): The current chess position
+
+        Returns:
+            chess.Move: A legal chess move
+        """
         return self.current_model.get_move(board)
