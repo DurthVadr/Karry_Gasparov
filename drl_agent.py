@@ -34,9 +34,31 @@ class MaskLayer(nn.Module):
         return masked_output
 
 # Deep Q-Network (DQN) Architecture
+class ResidualBlock(nn.Module):
+    """
+    Residual block for improved gradient flow.
+
+    This block includes two convolutional layers with batch normalization
+    and a residual connection to improve training stability and performance.
+    """
+    def __init__(self, channels):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        residual = x
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.bn2(self.conv2(x))
+        x += residual  # Add the residual connection
+        x = F.relu(x)  # Apply ReLU after the addition
+        return x
+
 class DQN(nn.Module):
     """
-    Deep Q-Network for chess position evaluation.
+    Improved Deep Q-Network for chess position evaluation.
 
     Architecture:
     - Input: 16 channel 8x8 board representation
@@ -46,42 +68,58 @@ class DQN(nn.Module):
       * Channel 14: En passant
       * Channel 15: Player to move
 
-    - Convolutional layers extract spatial features
-    - Fully connected layers map to Q-values for all possible moves
+    - Convolutional layers with residual connections extract spatial features
+    - Separate policy and value heads for better learning
     - Output: 4096 Q-values (64x64 possible from-to square combinations)
 
-    The network uses batch normalization and ReLU activations for better training.
+    The network uses batch normalization, residual connections, and ReLU activations
+    for better training stability and performance.
     """
     def __init__(self):
         super(DQN, self).__init__()
 
-        # Convolutional layers for spatial feature extraction
-        self.conv1 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)
-        self.bn1 = nn.BatchNorm2d(32)
+        # Initial convolutional layer
+        self.conv_in = nn.Conv2d(16, 64, kernel_size=3, stride=1, padding=1)
+        self.bn_in = nn.BatchNorm2d(64)
 
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
-        self.bn2 = nn.BatchNorm2d(64)
+        # Residual blocks for better gradient flow
+        self.res_block1 = ResidualBlock(64)
+        self.res_block2 = ResidualBlock(64)
+        self.res_block3 = ResidualBlock(64)
 
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
-        self.bn3 = nn.BatchNorm2d(128)
+        # Additional convolutional layer to increase feature maps
+        self.conv_out = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+        self.bn_out = nn.BatchNorm2d(128)
 
-        # Fully connected layers for Q-value prediction
+        # Fully connected layers for Q-value prediction with reduced size
         # 128 features * 8x8 board = 8192 flattened features
-        self.fc1 = nn.Linear(128 * 64, 4096)  # Hidden layer
-        self.fc2 = nn.Linear(4096, 4096)      # Output: 64*64 = 4096 possible moves
+        self.fc1 = nn.Linear(128 * 64, 2048)  # Reduced hidden layer size
+        self.fc2 = nn.Linear(2048, 4096)      # Output: 64*64 = 4096 possible moves
+
+        # Dropout for regularization
+        self.dropout = nn.Dropout(0.2)
 
         # Mask layer to ensure only legal moves are considered
         self.mask_layer = MaskLayer()
 
     def forward(self, x, mask=None):
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = F.relu(self.bn3(self.conv3(x)))
+        # Initial convolution
+        x = F.relu(self.bn_in(self.conv_in(x)))
+
+        # Apply residual blocks
+        x = self.res_block1(x)
+        x = self.res_block2(x)
+        x = self.res_block3(x)
+
+        # Final convolution
+        x = F.relu(self.bn_out(self.conv_out(x)))
 
         # Flatten the output for the fully connected layers
         x = x.view(x.size(0), -1) # Flatten all dimensions except batch
 
+        # Apply fully connected layers with dropout
         x = F.relu(self.fc1(x))
+        x = self.dropout(x)
         x = self.fc2(x) # Raw scores for each move
 
         if mask is not None:
@@ -90,67 +128,93 @@ class DQN(nn.Module):
         return x
 
 # Helper function to convert chess board to tensor representation
-# Adapted from bootstrapped_deep_reinforcement_learning.ipynb and chess-engine-2-reinforcement-learning.ipynb
-def board_to_tensor(board):
-    """Converts a chess.Board object to a 16x8x8 tensor."""
+# Optimized version for better performance
+def board_to_tensor(board, device=None):
+    """
+    Converts a chess.Board object to a 16x8x8 tensor.
+
+    Args:
+        board: A chess.Board object
+        device: Optional torch device to place the tensor on
+
+    Returns:
+        A tensor representation of the board with batch dimension
+    """
+    # Pre-allocate the tensor with zeros
     tensor = np.zeros((16, 8, 8), dtype=np.float32)
 
+    # Piece placement (channels 0-11)
     pieces = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING]
 
-    for i, piece in enumerate(pieces):
-        # White pieces
-        for square in board.pieces(piece, chess.WHITE):
-            rank, file = chess.square_rank(square), chess.square_file(square)
-            tensor[i, rank, file] = 1
-        # Black pieces
-        for square in board.pieces(piece, chess.BLACK):
-            rank, file = chess.square_rank(square), chess.square_file(square)
-            tensor[i + 6, rank, file] = 1
+    # More efficient piece placement using piece map
+    piece_map = board.piece_map()
+    for square, piece in piece_map.items():
+        rank, file = chess.square_rank(square), chess.square_file(square)
+        piece_type = piece.piece_type
+        color = piece.color
 
-    # Occupied squares (might not be needed if using empty square layer)
-    # tensor[12] = np.reshape(np.array([1 if board.piece_at(sq) else 0 for sq in chess.SQUARES]), (8, 8))
+        # Find the index in our pieces list
+        piece_idx = pieces.index(piece_type)
 
-    # Empty squares (alternative to occupied)
-    # for rank in range(8):
-    #     for file in range(8):
-    #         if board.piece_at(chess.square(file, rank)) is None:
-    #             tensor[12, rank, file] = 1
+        # Set the appropriate channel based on piece type and color
+        if color == chess.WHITE:
+            tensor[piece_idx, rank, file] = 1
+        else:  # BLACK
+            tensor[piece_idx + 6, rank, file] = 1
 
-    # Castling rights (binary encoded)
+    # Castling rights (channels 12-13)
     if board.has_kingside_castling_rights(chess.WHITE): tensor[12, 0, 7] = 1
     if board.has_queenside_castling_rights(chess.WHITE): tensor[12, 0, 0] = 1
     if board.has_kingside_castling_rights(chess.BLACK): tensor[13, 7, 7] = 1
     if board.has_queenside_castling_rights(chess.BLACK): tensor[13, 7, 0] = 1
 
-    # En passant square
+    # En passant square (channel 14)
     if board.ep_square:
         rank, file = chess.square_rank(board.ep_square), chess.square_file(board.ep_square)
         tensor[14, rank, file] = 1
 
-    # Player to move (1 for White, 0 for Black - consistent layer)
+    # Player to move (channel 15)
     if board.turn == chess.WHITE:
         tensor[15, :, :] = 1
-    else:
-        tensor[15, :, :] = 0 # Or -1 if preferred
 
-    return torch.from_numpy(tensor).unsqueeze(0) # Add batch dimension
+    # Convert to torch tensor and add batch dimension
+    tensor = torch.from_numpy(tensor).unsqueeze(0)
+
+    # Move to specified device if provided
+    if device is not None:
+        tensor = tensor.to(device)
+
+    return tensor
 
 # Helper function to create the move mask
-# Adapted from chess-engine-2-reinforcement-learning.ipynb
-def create_move_mask(board):
-    """Creates a 4096-element mask tensor for legal moves."""
+# Optimized version for better performance
+def create_move_mask(board, device=None):
+    """
+    Creates a 4096-element mask tensor for legal moves.
+
+    Args:
+        board: A chess.Board object
+        device: Optional torch device to place the tensor on
+
+    Returns:
+        A binary mask tensor with 1s for legal moves and 0s for illegal moves
+    """
+    # Pre-allocate the mask with zeros
     mask = torch.zeros(4096, dtype=torch.float32)
+
+    # Set indices for all legal moves
     for move in board.legal_moves:
         index = move.from_square * 64 + move.to_square
-        # Handle promotion - for simplicity, allow any promotion for now
-        # A more sophisticated approach would create separate indices for promotions
-        if move.promotion:
-             # Simple approach: mark the basic move index
-             mask[index] = 1
-             # Or, reserve specific indices for promotions (e.g., 4096-4351)
-        else:
-            mask[index] = 1
-    return mask.unsqueeze(0) # Add batch dimension
+        mask[index] = 1
+
+    # Add batch dimension
+    mask = mask.unsqueeze(0)
+
+    # Move to specified device if provided
+    if device is not None:
+        mask = mask.to(device)
+
+    return mask
 
 # Chess Agent Implementation
 class ChessAgent:
