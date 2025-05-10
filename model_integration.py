@@ -37,7 +37,7 @@ class RandomModel:
 
 class DRLChessModel:
     """Wrapper for the deep reinforcement learning chess model"""
-    def __init__(self, model_path=None, repetition_penalty=0.8):
+    def __init__(self, model_path=None, repetition_penalty=0.95):
         self.name = "Deep Reinforcement Learning Chess Bot"
 
         # Create agent with repetition avoidance
@@ -66,7 +66,7 @@ class ModelIntegration:
         """Initialize with a random model as default"""
         self.current_model = RandomModel()
 
-    def load_model(self, model_path, repetition_penalty=0.8):
+    def load_model(self, model_path, repetition_penalty=0.95):
         """
         Load a chess model from a file.
 
@@ -87,12 +87,23 @@ class ModelIntegration:
         if model_path.endswith('.pt') or model_path.endswith('.pth'):
             # PyTorch model (our DRL model)
             try:
+                print(f"Attempting to load model from {model_path}...")
+                # Check if file exists and get its size
+                if os.path.exists(model_path):
+                    file_size = os.path.getsize(model_path) / (1024 * 1024)  # Size in MB
+                    print(f"Model file exists, size: {file_size:.2f} MB")
+                else:
+                    print(f"WARNING: Model file {model_path} does not exist!")
+
                 self.current_model = DRLChessModel(model_path=model_path, repetition_penalty=repetition_penalty)
-                print(f"Loaded DRL model from {model_path} with repetition penalty {repetition_penalty}")
+                print(f"Successfully loaded DRL model from {model_path} with repetition penalty {repetition_penalty}")
                 return self.current_model
             except Exception as e:
                 print(f"Error loading DRL model: {str(e)}")
+                import traceback
+                traceback.print_exc()
                 # Fall back to random model
+                print("Falling back to random model due to error")
                 self.current_model = RandomModel()
                 return self.current_model
         elif model_path.endswith('.h5'):

@@ -245,14 +245,23 @@ class ChessGUI:
         # If a model is loaded, use it to make a move
         if self.model:
             try:
+                print("\n--- AI MOVE REQUESTED ---")
+                print(f"Current board state: {self.board.fen()}")
+                print(f"Using model: {self.model.name if hasattr(self.model, 'name') else 'Unknown'}")
 
                 move = self.get_model_move()
+                print(f"Selected move: {move.uci()}")
             except Exception as e:
-                messagebox.showerror("Error", f"Error getting move from model: {str(e)}")
+                error_msg = f"Error getting move from model: {str(e)}"
+                print(f"ERROR: {error_msg}")
+                messagebox.showerror("Error", error_msg)
                 move = random.choice(list(self.board.legal_moves))
+                print(f"Falling back to random move: {move.uci()}")
         else:
             # If no model is loaded, just make a random move
+            print("No model loaded, making random move")
             move = random.choice(list(self.board.legal_moves))
+            print(f"Random move: {move.uci()}")
 
         self.make_move(move)
 
@@ -284,65 +293,17 @@ class ChessGUI:
 
         if model_path:
             try:
-                # Ask user for repetition penalty value
-                repetition_penalty_dialog = tk.Toplevel(self.root)
-                repetition_penalty_dialog.title("Repetition Penalty")
-                repetition_penalty_dialog.geometry("300x150")
-                repetition_penalty_dialog.transient(self.root)
-                repetition_penalty_dialog.grab_set()
+                # Use a fixed repetition penalty value (matching the default in ChessAgent)
+                repetition_penalty = 0.95
 
-                # Add explanation label
-                explanation = ttk.Label(
-                    repetition_penalty_dialog,
-                    text="Set repetition penalty (0.1-0.9):\nLower values = stronger penalty\nRecommended: 0.8",
-                    wraplength=280
-                )
-                explanation.pack(pady=10)
-
-                # Add slider for repetition penalty
-                repetition_penalty_var = tk.DoubleVar(value=0.8)
-                repetition_slider = ttk.Scale(
-                    repetition_penalty_dialog,
-                    from_=0.1,
-                    to=0.9,
-                    orient=tk.HORIZONTAL,
-                    variable=repetition_penalty_var,
-                    length=200
-                )
-                repetition_slider.pack(pady=5)
-
-                # Add value label
-                value_label = ttk.Label(repetition_penalty_dialog, text="0.8")
-                value_label.pack(pady=5)
-
-                # Update value label when slider changes
-                def update_value_label(event):
-                    value_label.config(text=f"{repetition_penalty_var.get():.1f}")
-
-                repetition_slider.bind("<Motion>", update_value_label)
-
-                # Add OK button
-                ok_button = ttk.Button(
-                    repetition_penalty_dialog,
-                    text="OK",
-                    command=repetition_penalty_dialog.destroy
-                )
-                ok_button.pack(pady=10)
-
-                # Wait for dialog to close
-                self.root.wait_window(repetition_penalty_dialog)
-
-                # Get repetition penalty value
-                repetition_penalty = repetition_penalty_var.get()
-
-                # Load the model using the model integration with repetition penalty
+                # Load the model using the model integration
                 self.model = self.model_integration.load_model(
                     model_path,
                     repetition_penalty=repetition_penalty
                 )
                 messagebox.showinfo(
                     "Model Loaded",
-                    f"Model loaded from {model_path}\nRepetition penalty: {repetition_penalty:.1f}"
+                    f"Model loaded from {model_path}"
                 )
             except Exception as e:
                 messagebox.showerror("Error", f"Error loading model: {str(e)}")

@@ -176,10 +176,26 @@ class ChessAgent:
         # Initialize the policy network
         self.policy_net = DQN()
 
+        # Flag to track if model was loaded successfully
+        self.model_loaded = False
+
         # Load pre-trained model if provided
         if model_path and os.path.exists(model_path):
-            self.policy_net.load_state_dict(torch.load(model_path))
-            print(f"Loaded model from {model_path}")
+            try:
+                print(f"ChessAgent: Loading model from {model_path}")
+                # Try to load with map_location to handle models trained on different devices
+                self.policy_net.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+                print(f"ChessAgent: Successfully loaded model from {model_path}")
+                self.model_loaded = True
+            except Exception as e:
+                print(f"ChessAgent: Error loading model: {str(e)}")
+                import traceback
+                traceback.print_exc()
+        else:
+            if model_path:
+                print(f"ChessAgent: Model file {model_path} does not exist")
+            else:
+                print("ChessAgent: No model path provided")
 
         # Set to evaluation mode (no gradient tracking needed for inference)
         self.policy_net.eval()
@@ -210,6 +226,10 @@ class ChessAgent:
         6. Handles special cases like promotions
         7. Ensures the selected move is legal
         """
+        # Print a message to indicate if we're using a trained model or not
+        if not self.model_loaded:
+            print("WARNING: Using untrained model for move selection!")
+
         with torch.no_grad():  # No need to track gradients for inference
             # Convert board to tensor representation
             state_tensor = board_to_tensor(board)
@@ -218,11 +238,41 @@ class ChessAgent:
             # Get Q-values for all moves from the policy network
             q_values = self.policy_net(state_tensor, move_mask)
 
+            # Print some stats about the Q-values to help debug
+            if torch.isnan(q_values).any():
+                print("WARNING: NaN values detected in Q-values!")
+
+            # Replace -inf values with a large negative number for better numerical stability
+            q_values_for_stats = q_values.clone()
+            q_values_for_stats[q_values_for_stats == float('-inf')] = -1e6
+            print(f"Q-values stats: min={q_values_for_stats.min().item():.4f}, max={q_values_for_stats.max().item():.4f}, mean={q_values_for_stats.mean().item():.4f}")
+
+            # Get the top 5 moves based on Q-values
+            legal_move_indices = [m.from_square * 64 + m.to_square for m in board.legal_moves]
+            legal_q_values = q_values[0, legal_move_indices]
+
+            # Get top 5 legal moves
+            top_values, top_indices = torch.topk(legal_q_values, min(5, len(legal_move_indices)))
+            print("Top 5 moves:")
+            for i, (value_idx, q_value) in enumerate(zip(top_indices, top_values)):
+                move_idx = legal_move_indices[value_idx]
+                from_square = move_idx // 64
+                to_square = move_idx % 64
+                move = chess.Move(from_square, to_square)
+                print(f"  {i+1}. {move.uci()} (Q-value: {q_value.item():.4f})")
+
             # Apply repetition avoidance by penalizing moves that lead to repeated positions
             adjusted_q_values = self._apply_repetition_penalties(board, q_values.clone())
 
-            # Select the move with the highest adjusted Q-value
-            best_move_index = torch.argmax(adjusted_q_values).item()
+            # Get the legal move indices
+            legal_move_indices = [m.from_square * 64 + m.to_square for m in board.legal_moves]
+
+            # Get the adjusted Q-values for legal moves only
+            legal_adjusted_q_values = adjusted_q_values[0, legal_move_indices]
+
+            # Select the move with the highest adjusted Q-value among legal moves
+            best_legal_index_in_list = torch.argmax(legal_adjusted_q_values).item()
+            best_move_index = legal_move_indices[best_legal_index_in_list]
 
             # Convert index to chess move coordinates
             from_square = best_move_index // 64
@@ -234,47 +284,24 @@ class ChessAgent:
             # Handle pawn promotion (default to queen promotion)
             piece = board.piece_at(from_square)
             if piece and piece.piece_type == chess.PAWN:
-                 # Check if pawn is moving to the last rank
-                 if board.turn == chess.WHITE and chess.square_rank(to_square) == 7:
-                     potential_move.promotion = chess.QUEEN
-                 elif board.turn == chess.BLACK and chess.square_rank(to_square) == 0:
-                     potential_move.promotion = chess.QUEEN
+                # Check if pawn is moving to the last rank
+                if board.turn == chess.WHITE and chess.square_rank(to_square) == 7:
+                    potential_move = chess.Move(from_square, to_square, promotion=chess.QUEEN)
+                elif board.turn == chess.BLACK and chess.square_rank(to_square) == 0:
+                    potential_move = chess.Move(from_square, to_square, promotion=chess.QUEEN)
 
+            # Double-check that the move is legal
             if potential_move in board.legal_moves:
                 # Update position history with the selected move
                 self._update_position_history(board, potential_move)
                 return potential_move
             else:
-                # Fallback: if the predicted best move isn't legal (e.g., mask issue),
-                # choose a random legal move.
-                print(f"Warning: Predicted best move index {best_move_index} ({potential_move.uci()}) is not legal. Choosing random move.")
-                # Find the highest Q-value among *legal* moves instead
-                legal_move_indices = [m.from_square * 64 + m.to_square for m in board.legal_moves]
-                legal_q_values = q_values[0, legal_move_indices]
-                best_legal_index_in_list = torch.argmax(legal_q_values).item()
-                best_move_index = legal_move_indices[best_legal_index_in_list]
-
-                from_square = best_move_index // 64
-                to_square = best_move_index % 64
-                potential_move = chess.Move(from_square, to_square)
-                # Handle promotion again
-                piece = board.piece_at(from_square)
-                if piece and piece.piece_type == chess.PAWN:
-                     if board.turn == chess.WHITE and chess.square_rank(to_square) == 7:
-                         potential_move.promotion = chess.QUEEN
-                     elif board.turn == chess.BLACK and chess.square_rank(to_square) == 0:
-                         potential_move.promotion = chess.QUEEN
-
-                if potential_move in board.legal_moves:
-                     # Update position history with the selected move
-                     self._update_position_history(board, potential_move)
-                     return potential_move
-                else:
-                     print("Fallback failed, choosing random legal move.")
-                     # Choose a random move and update position history
-                     random_move = random.choice(list(board.legal_moves))
-                     self._update_position_history(board, random_move)
-                     return random_move
+                # This should rarely happen since we're selecting from legal moves
+                print(f"Warning: Selected move {potential_move.uci()} is not legal. Choosing random move.")
+                # Choose a random move and update position history
+                random_move = random.choice(list(board.legal_moves))
+                self._update_position_history(board, random_move)
+                return random_move
 
     def _apply_repetition_penalties(self, board, q_values):
         """
