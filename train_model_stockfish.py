@@ -1,4 +1,3 @@
-
 import chess
 import chess.engine
 import torch
@@ -683,6 +682,185 @@ class ChessTrainerWithStockfish:
         else:
             print(f"Model file {filepath} not found")
             return False
+
+    def train_from_pgn(self, data_dir, num_games=100):
+        """
+        Train the model using high-quality PGN games with optimized processing.
+        
+        Args:
+            data_dir (str): Directory containing PGN files
+            num_games (int): Number of games to train on
+        """
+        print(f"Starting PGN training with {num_games} games...")
+        
+        # Get list of PGN files
+        pgn_files = [f for f in os.listdir(data_dir) if f.endswith('.pgn')]
+        if not pgn_files:
+            print(f"No PGN files found in {data_dir}")
+            return
+        
+        # Pre-allocate tensors for batch processing
+        batch_states = []
+        batch_actions = []
+        batch_rewards = []
+        batch_next_states = []
+        batch_dones = []
+        batch_masks = []
+        batch_next_masks = []
+        
+        games_processed = 0
+        total_positions = 0
+        batch_size = 1024  # Process positions in larger batches
+        
+        # Configure Stockfish for faster analysis
+        if self.stockfish:
+            self.stockfish.configure({
+                "Threads": 4,  # Use multiple threads
+                "Hash": 128,   # Increase hash size
+                "Skill Level": self.stockfish_level  # Set skill level
+            })
+        
+        for pgn_file in pgn_files:
+            if games_processed >= num_games:
+                break
+                
+            file_path = os.path.join(data_dir, pgn_file)
+            print(f"\nProcessing {pgn_file}...")
+            
+            # Read multiple games at once for better I/O performance
+            with open(file_path) as pgn:
+                while games_processed < num_games:
+                    try:
+                        # Process multiple games in parallel
+                        games = []
+                        for _ in range(min(10, num_games - games_processed)):
+                            game = chess.pgn.read_game(pgn)
+                            if game is None:
+                                break
+                            games.append(game)
+                        
+                        if not games:
+                            break
+                        
+                        # Process each game
+                        for game in games:
+                            # Convert mainline to list first
+                            mainline_moves = list(game.mainline_moves())
+                            
+                            # Skip games that are too short or too long
+                            if len(mainline_moves) < 10 or len(mainline_moves) > 200:
+                                continue
+                                
+                            # Process each position in the game
+                            board = game.board()
+                            prev_board = None
+                            
+                            # Process moves in batches
+                            for i in range(0, len(mainline_moves), 10):  # Process 10 moves at a time
+                                batch_moves = mainline_moves[i:i+10]
+                                
+                                for move in batch_moves:
+                                    # Convert board to tensor
+                                    state = board_to_tensor(board)
+                                    mask = create_move_mask(board).unsqueeze(0)
+                                    
+                                    # Get Stockfish evaluation (with reduced depth for speed)
+                                    if self.stockfish:
+                                        reward = self.calculate_stockfish_reward(board, prev_board)
+                                    else:
+                                        reward = self.calculate_reward(board)
+                                    
+                                    # Make the move
+                                    board.push(move)
+                                    
+                                    # Get next state
+                                    next_state = board_to_tensor(board)
+                                    next_mask = create_move_mask(board).unsqueeze(0)
+                                    
+                                    # Add to batch
+                                    batch_states.append(state)
+                                    batch_actions.append(move.from_square * 64 + move.to_square)
+                                    batch_rewards.append(reward)
+                                    batch_next_states.append(next_state)
+                                    batch_dones.append(board.is_game_over())
+                                    batch_masks.append(mask)
+                                    batch_next_masks.append(next_mask)
+                                    
+                                    prev_board = board.copy()
+                                    total_positions += 1
+                                    
+                                    # Process batch when it's full
+                                    if len(batch_states) >= batch_size:
+                                        self._process_batch(
+                                            batch_states, batch_actions, batch_rewards,
+                                            batch_next_states, batch_dones,
+                                            batch_masks, batch_next_masks
+                                        )
+                                        # Clear batches
+                                        batch_states = []
+                                        batch_actions = []
+                                        batch_rewards = []
+                                        batch_next_states = []
+                                        batch_dones = []
+                                        batch_masks = []
+                                        batch_next_masks = []
+                            
+                            games_processed += 1
+                            if games_processed % 10 == 0:
+                                print(f"Processed {games_processed}/{num_games} games")
+                                
+                    except Exception as e:
+                        print(f"Error processing game: {e}")
+                        continue
+        
+        # Process any remaining positions in the batch
+        if batch_states:
+            self._process_batch(
+                batch_states, batch_actions, batch_rewards,
+                batch_next_states, batch_dones,
+                batch_masks, batch_next_masks
+            )
+        
+        print(f"\nPGN training completed!")
+        print(f"Total games processed: {games_processed}")
+        print(f"Total positions processed: {total_positions}")
+        
+        # Save the model after PGN training
+        self.save_model("model_pgn_improved.pt")
+        
+        # Test model strength
+        print("\nTesting model strength after PGN training...")
+        strength = self.test_model_strength(num_games=5)
+        print(f"Model strength after PGN training: Stockfish level {strength}")
+
+    def _process_batch(self, states, actions, rewards, next_states, dones, masks, next_masks):
+        """Process a batch of experiences efficiently."""
+        # Convert lists to tensors
+        state_batch = torch.cat(states)
+        action_batch = torch.tensor(actions, dtype=torch.long).unsqueeze(1)
+        reward_batch = torch.tensor(rewards, dtype=torch.float32)
+        next_state_batch = torch.cat(next_states)
+        done_batch = torch.tensor(dones, dtype=torch.bool)
+        mask_batch = torch.cat(masks)
+        next_mask_batch = torch.cat(next_masks)
+        
+        # Store experiences in memory
+        for i in range(len(states)):
+            self.memory.push(
+                state_batch[i],
+                action_batch[i].item(),
+                next_state_batch[i],
+                reward_batch[i].item(),
+                done_batch[i].item(),
+                mask_batch[i],
+                next_mask_batch[i]
+            )
+        
+        # Optimize model if enough samples
+        if len(self.memory) >= self.batch_size:
+            loss = self.optimize_model()
+            if loss is not None:
+                self.training_stats['losses'].append(loss)
 
 if __name__ == "__main__":
     # Create trainer with Stockfish and improved architecture

@@ -107,15 +107,6 @@ def board_to_tensor(board):
             rank, file = chess.square_rank(square), chess.square_file(square)
             tensor[i + 6, rank, file] = 1
 
-    # Occupied squares (might not be needed if using empty square layer)
-    # tensor[12] = np.reshape(np.array([1 if board.piece_at(sq) else 0 for sq in chess.SQUARES]), (8, 8))
-
-    # Empty squares (alternative to occupied)
-    # for rank in range(8):
-    #     for file in range(8):
-    #         if board.piece_at(chess.square(file, rank)) is None:
-    #             tensor[12, rank, file] = 1
-
     # Castling rights (binary encoded)
     if board.has_kingside_castling_rights(chess.WHITE): tensor[12, 0, 7] = 1
     if board.has_queenside_castling_rights(chess.WHITE): tensor[12, 0, 0] = 1
@@ -131,9 +122,10 @@ def board_to_tensor(board):
     if board.turn == chess.WHITE:
         tensor[15, :, :] = 1
     else:
-        tensor[15, :, :] = 0 # Or -1 if preferred
+        tensor[15, :, :] = 0
 
-    return torch.from_numpy(tensor).unsqueeze(0) # Add batch dimension
+    # Convert to tensor and add batch dimension
+    return torch.from_numpy(tensor).unsqueeze(0)  # Shape: (1, 16, 8, 8)
 
 # Helper function to create the move mask
 # Adapted from chess-engine-2-reinforcement-learning.ipynb
