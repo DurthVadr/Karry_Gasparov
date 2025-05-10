@@ -1,0 +1,68 @@
+Evaluation of model: models/model_pgn_final.pt
+Date: 2025-05-11 00:24:47
+Games per level: 10
+Evaluation time: 90.9 seconds
+
+=== Results Summary ===
+Stockfish Level 1:
+  Wins: 0/10 (0.0%)
+  Draws: 0/10 (0.0%)
+  Losses: 10/10 (100.0%)
+  Score: 0.0%
+
+Stockfish Level 2:
+  Wins: 0/10 (0.0%)
+  Draws: 0/10 (0.0%)
+  Losses: 10/10 (100.0%)
+  Score: 0.0%
+
+Stockfish Level 3:
+  Wins: 0/10 (0.0%)
+  Draws: 0/10 (0.0%)
+  Losses: 10/10 (100.0%)
+  Score: 0.0%
+
+Stockfish Level 4:
+  Wins: 0/10 (0.0%)
+  Draws: 0/10 (0.0%)
+  Losses: 10/10 (100.0%)
+  Score: 0.0%
+
+Stockfish Level 5:
+  Wins: 0/10 (0.0%)
+  Draws: 0/10 (0.0%)
+  Losses: 10/10 (100.0%)
+  Score: 0.0%
+
+Stockfish Level 6:
+  Wins: 0/10 (0.0%)
+  Draws: 0/10 (0.0%)
+  Losses: 10/10 (100.0%)
+  Score: 0.0%
+
+Stockfish Level 7:
+  Wins: 0/10 (0.0%)
+  Draws: 0/10 (0.0%)
+  Losses: 10/10 (100.0%)
+  Score: 0.0%
+
+Stockfish Level 8:
+  Wins: 0/10 (0.0%)
+  Draws: 0/10 (0.0%)
+  Losses: 10/10 (100.0%)
+  Score: 0.0%
+
+Stockfish Level 9:
+  Wins: 0/10 (0.0%)
+  Draws: 0/10 (0.0%)
+  Losses: 10/10 (100.0%)
+  Score: 0.0%
+
+Stockfish Level 10:
+  Wins: 0/10 (0.0%)
+  Draws: 0/10 (0.0%)
+  Losses: 10/10 (100.0%)
+  Score: 0.0%
+
+=== Model Strength Assessment ===
+The model is below Stockfish level 1 strength

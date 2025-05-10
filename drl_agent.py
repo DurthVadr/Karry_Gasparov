@@ -306,30 +306,11 @@ class ChessAgent:
             if torch.isnan(q_values).any():
                 print("WARNING: NaN values detected in Q-values!")
 
-            # Replace -inf values with a large negative number for better numerical stability
-            q_values_for_stats = q_values.clone()
-            q_values_for_stats[q_values_for_stats == float('-inf')] = -1e6
-            print(f"Q-values stats: min={q_values_for_stats.min().item():.4f}, max={q_values_for_stats.max().item():.4f}, mean={q_values_for_stats.mean().item():.4f}")
-
-            # Get the top 5 moves based on Q-values
+            # Get the legal move indices
             legal_move_indices = [m.from_square * 64 + m.to_square for m in board.legal_moves]
-            legal_q_values = q_values[0, legal_move_indices]
-
-            # Get top 5 legal moves
-            top_values, top_indices = torch.topk(legal_q_values, min(5, len(legal_move_indices)))
-            print("Top 5 moves:")
-            for i, (value_idx, q_value) in enumerate(zip(top_indices, top_values)):
-                move_idx = legal_move_indices[value_idx]
-                from_square = move_idx // 64
-                to_square = move_idx % 64
-                move = chess.Move(from_square, to_square)
-                print(f"  {i+1}. {move.uci()} (Q-value: {q_value.item():.4f})")
 
             # Apply repetition avoidance by penalizing moves that lead to repeated positions
             adjusted_q_values = self._apply_repetition_penalties(board, q_values.clone())
-
-            # Get the legal move indices
-            legal_move_indices = [m.from_square * 64 + m.to_square for m in board.legal_moves]
 
             # Get the adjusted Q-values for legal moves only
             legal_adjusted_q_values = adjusted_q_values[0, legal_move_indices]
