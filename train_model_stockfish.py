@@ -97,7 +97,7 @@ class PrioritizedReplayMemory:
         return len(self.memory)
 
 class ChessTrainerWithStockfish:
-    def __init__(self, model_dir="models", stockfish_path="/opt/homebrew/Cellar/stockfish/17.1/bin/stockfish"):
+    def __init__(self, model_dir="models", stockfish_path="C:\\Users\\Can\\Documents\\stockfish\\stockfish-windows-x86-64-avx2.exe"):
         # Create model directory if it doesn't exist
         if not os.path.exists(model_dir):
             os.makedirs(model_dir)
@@ -118,8 +118,10 @@ class ChessTrainerWithStockfish:
             self.stockfish = None
 
         # Initialize networks with original DQN architecture
-        self.policy_net = DQN()
-        self.target_net = DQN()
+        #self.policy_net = DQN() #uncomment for macOS
+        #self.target_net = DQN() #uncomment for macOS
+        self.policy_net = DQN().to(self.device) # Comment for macOS
+        self.target_net = DQN().to(self.device) # Comment for macOS
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()  # Target network is only used for inference
 
@@ -770,8 +772,9 @@ if __name__ == "__main__":
         print("Using prioritized experience replay with larger memory capacity")
         print("Using enhanced reward function with deeper Stockfish analysis")
 
-        # Train on PGN data with improved parameters
-        trainer.train_from_pgn(data_dir, num_games=100)
+        # Train from all PGNs
+        num_pgn_games = 9999999  # large number, effectively "all"
+        trainer.train_from_pgn(data_dir, num_games=num_pgn_games)
 
         # Save intermediate model
         trainer.save_model("model_pgn_improved.pt")
@@ -786,7 +789,7 @@ if __name__ == "__main__":
     print("Using learning rate scheduling for better convergence")
 
     # Run self-play training with improved parameters
-    rewards, lengths, losses = trainer.train_self_play(num_episodes=500)
+    rewards, lengths, losses = trainer.train_self_play(num_episodes=1000)
 
     # Plot final training results
     trainer.plot_training_progress()

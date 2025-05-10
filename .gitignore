@@ -1,4 +1,6 @@
 /.venv
+/venv
+/venv39
 /data
 /__pycache__
 /models

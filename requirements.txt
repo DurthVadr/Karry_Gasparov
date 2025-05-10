@@ -6,10 +6,13 @@ numpy>=1.20.0          # Numerical computing
 # GUI dependencies
 Pillow==10.2.0         # Image processing
 cairosvg==2.7.1        # SVG to PNG conversion
-tkinter                # GUI framework (usually comes with Python)
+#tkinter                # GUI framework (usually comes with Python)
 
 # Training dependencies
 matplotlib>=3.5.0      # For plotting training progress
 
 # Optional dependencies
 # stockfish              # Chess engine (install separately via package manager)
+# Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser     # Windows PowerShell command to allow script execution
+# venv\Scripts\activate
+# pip install -r requirements.txt
