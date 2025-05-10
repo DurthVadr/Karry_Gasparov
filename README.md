@@ -148,67 +148,130 @@ print(f"Model strength: Stockfish level {strength}")
    - Add PGN files to the `data` directory
    - Recommended: Use high-quality games from [Lichess Elite Database](https://database.nikonoel.fr/)
 
-### 2. Training Process
+### 2. Running from Console
 
-1. **Initial PGN Training**
+1. **Create a Training Script**
+   Create a file named `train.py` with the following content:
    ```python
-   # Initialize trainer
-   trainer = ChessTrainerWithStockfish(
-       model_dir="models",
-       stockfish_path="/path/to/stockfish",  # Update with your Stockfish path
-       stockfish_level=8
-   )
-
-   # Train on PGN data first
-   print("Starting PGN training phase...")
-   trainer.train_from_pgn("data/", num_games=100)
-   ```
-
-2. **Self-Play Training**
-   ```python
-   # Continue with self-play training
-   print("\nStarting self-play training phase...")
-   rewards, lengths, losses = trainer.train_self_play(num_episodes=1000)
-   ```
-
-3. **Monitor Training**
-   - Check the console output for:
-     - Episode rewards
-     - Game lengths
-     - Model strength level
-     - Learning rate changes
-   - View training progress plots in the `models` directory
-
-### 3. Testing the Model
-
-1. **Test Model Strength**
-   ```python
-   # Test against different Stockfish levels
-   strength = trainer.test_model_strength(num_games=10)
-   print(f"Model strength: Stockfish level {strength}")
-   ```
-
-2. **Play Against the Model**
-   ```python
-   # Load the trained model
-   agent = ChessAgent(model_path="models/model_improved_final.pt")
+   from train_model_stockfish import ChessTrainerWithStockfish
    
-   # Play a game
-   board = chess.Board()
-   while not board.is_game_over():
-       if board.turn == chess.WHITE:
-           # Your move
-           move = input("Enter your move (e.g., e2e4): ")
-           board.push(chess.Move.from_uci(move))
-       else:
-           # Model's move
-           move = agent.select_move(board)
-           board.push(move)
-           print(f"Model played: {move.uci()}")
-       print(board)
+   def main():
+       # Initialize trainer
+       trainer = ChessTrainerWithStockfish(
+           model_dir="models",
+           stockfish_path="/usr/local/bin/stockfish",  # Update with your Stockfish path
+           stockfish_level=8
+       )
+       
+       # Train on PGN data first
+       print("Starting PGN training phase...")
+       trainer.train_from_pgn("data/", num_games=100)
+       
+       # Continue with self-play training
+       print("\nStarting self-play training phase...")
+       rewards, lengths, losses = trainer.train_self_play(num_episodes=1000)
+   
+   if __name__ == "__main__":
+       main()
    ```
 
-### 4. Training Parameters
+2. **Run the Training**
+   ```bash
+   # Make sure you're in the project directory
+   cd /path/to/chess/training/project
+   
+   # Create necessary directories
+   mkdir -p models data
+   
+   # Run the training script
+   python train.py
+   ```
+
+3. **Monitor Training Progress**
+   ```bash
+   # View the latest training progress
+   tail -f models/training_progress.log
+   
+   # Check model checkpoints
+   ls -l models/checkpoint_*
+   ```
+
+4. **Test the Model**
+   Create a file named `test_model.py`:
+   ```python
+   from train_model_stockfish import ChessTrainerWithStockfish
+   
+   def main():
+       trainer = ChessTrainerWithStockfish(
+           model_dir="models",
+           stockfish_path="/usr/local/bin/stockfish"
+       )
+       strength = trainer.test_model_strength(num_games=10)
+       print(f"Model strength: Stockfish level {strength}")
+   
+   if __name__ == "__main__":
+       main()
+   ```
+   
+   Run the test:
+   ```bash
+   python test_model.py
+   ```
+
+5. **Play Against the Model**
+   Create a file named `play_chess.py`:
+   ```python
+   from train_model_stockfish import ChessAgent
+   import chess
+   
+   def main():
+       agent = ChessAgent(model_path="models/model_improved_final.pt")
+       board = chess.Board()
+       
+       while not board.is_game_over():
+           print("\nCurrent position:")
+           print(board)
+           
+           if board.turn == chess.WHITE:
+               move = input("Enter your move (e.g., e2e4): ")
+               try:
+                   board.push(chess.Move.from_uci(move))
+               except:
+                   print("Invalid move! Try again.")
+                   continue
+           else:
+               move = agent.select_move(board)
+               board.push(move)
+               print(f"Model played: {move.uci()}")
+       
+       print("\nGame Over!")
+       print(f"Result: {board.outcome().result()}")
+   
+   if __name__ == "__main__":
+       main()
+   ```
+   
+   Run the game:
+   ```bash
+   python play_chess.py
+   ```
+
+6. **Common Console Commands**
+   ```bash
+   # Check GPU availability (if using CUDA)
+   nvidia-smi
+   
+   # Monitor system resources during training
+   top
+   
+   # Check training logs
+   cat models/training_progress.log
+   
+   # Backup model checkpoints
+   cp -r models models_backup_$(date +%Y%m%d)
+   ```
+
+### 3. Training Parameters
 
 You can adjust these parameters in `train_model_stockfish.py`:
 
@@ -231,13 +294,13 @@ CURRICULUM_STAGES = [
 ]
 ```
 
-### 5. Expected Training Time
+### 4. Expected Training Time
 
 - PGN Training: 1-2 hours (100 games)
 - Self-Play Training: 5-10 hours (1000 episodes)
 - Total: 6-12 hours
 
-### 6. Monitoring Progress
+### 5. Monitoring Progress
 
 1. **Console Output**
    ```
@@ -255,7 +318,7 @@ CURRICULUM_STAGES = [
    - Located in `models/` directory
    - Format: `checkpoint_episode_X.pt`
 
-### 7. Troubleshooting Common Issues
+### 6. Troubleshooting Common Issues
 
 1. **Out of Memory**
    ```python
