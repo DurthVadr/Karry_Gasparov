@@ -1,3 +1,4 @@
+
 import chess
 import chess.engine
 import torch
@@ -97,43 +98,67 @@ class PrioritizedReplayMemory:
         return len(self.memory)
 
 class ChessTrainerWithStockfish:
-    def __init__(self, model_dir="models", stockfish_path="/opt/homebrew/Cellar/stockfish/17.1/bin/stockfish"):
+    """
+    Enhanced chess trainer that uses Stockfish for evaluation and implements
+    various improvements for faster and better training.
+    
+    Attributes:
+        model_dir (str): Directory to save models
+        stockfish_path (str): Path to Stockfish executable
+        stockfish_level (int): Stockfish skill level (1-20)
+        device (torch.device): Device to run training on (CPU/GPU)
+        policy_net (DQN): Policy network
+        target_net (DQN): Target network
+        optimizer (torch.optim.Adam): Optimizer
+        memory (PrioritizedReplayMemory): Experience replay memory
+        training_stats (dict): Training statistics
+    """
+    
+    def __init__(self, model_dir="models", stockfish_path="/opt/homebrew/Cellar/stockfish/17.1/bin/stockfish", stockfish_level=8):
+        """
+        Initialize the chess trainer with improved parameters.
+        
+        Args:
+            model_dir (str): Directory to save models
+            stockfish_path (str): Path to Stockfish executable
+            stockfish_level (int): Stockfish skill level (1-20)
+        """
         # Create model directory if it doesn't exist
         if not os.path.exists(model_dir):
             os.makedirs(model_dir)
 
         self.model_dir = model_dir
+        self.stockfish_level = stockfish_level
 
         # Check for GPU availability
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
 
-        # Initialize Stockfish engine
+        # Initialize Stockfish engine with specific level
         try:
             self.stockfish = chess.engine.SimpleEngine.popen_uci(stockfish_path)
-            print(f"Stockfish engine initialized successfully")
+            self.stockfish.configure({"Skill Level": stockfish_level})
+            print(f"Stockfish engine initialized at level {stockfish_level}")
         except Exception as e:
             print(f"Error initializing Stockfish engine: {e}")
             print("Falling back to material-based evaluation")
             self.stockfish = None
 
-        # Initialize networks with original DQN architecture
+        # Initialize networks with improved architecture
         self.policy_net = DQN()
         self.target_net = DQN()
         self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.target_net.eval()  # Target network is only used for inference
+        self.target_net.eval()
 
-        # Initialize optimizer with higher learning rate
+        # Initialize optimizer with adaptive learning rate
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=0.001)
-
-        # Add learning rate scheduler
-        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=100, gamma=0.5)
+        self.scheduler = self._create_adaptive_scheduler()
 
         # Initialize prioritized replay memory with larger capacity
         self.memory = PrioritizedReplayMemory(100000)
 
         # Improved training parameters
-        self.batch_size = 256  # Larger batch size
+        self.batch_size = 1024  # Larger batch size for better gradient estimates
         self.gamma = 0.99  # Discount factor
         self.eps_start = 1.0  # Start with full exploration
         self.eps_end = 0.05
@@ -147,14 +172,40 @@ class ChessTrainerWithStockfish:
             'episode_rewards': [],
             'episode_lengths': [],
             'losses': [],
-            'avg_q_values': []
+            'avg_q_values': [],
+            'win_rates': [],
+            'learning_rates': []
         }
 
+    def _create_adaptive_scheduler(self):
+        """
+        Create an adaptive learning rate scheduler.
+        
+        Returns:
+            torch.optim.lr_scheduler: Learning rate scheduler
+        """
+        return optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
+            mode='max',
+            factor=0.5,
+            patience=10,
+            verbose=True
+        )
+
     def select_action(self, state, mask, board):
-        """Select an action using epsilon-greedy policy with improved exploration"""
+        """
+        Select an action using improved epsilon-greedy policy with adaptive exploration.
+        
+        Args:
+            state (torch.Tensor): Current board state
+            mask (torch.Tensor): Move mask
+            board (chess.Board): Current chess board
+            
+        Returns:
+            tuple: (action_idx, move)
+        """
         sample = random.random()
-        eps_threshold = self.eps_end + (self.eps_start - self.eps_end) * \
-                        np.exp(-1. * self.steps_done / self.eps_decay)
+        eps_threshold = self._get_adaptive_epsilon()
         self.steps_done += 1
 
         # Move tensors to the correct device
@@ -163,55 +214,44 @@ class ChessTrainerWithStockfish:
 
         if sample > eps_threshold:
             with torch.no_grad():
-                # Use policy network to select best action
                 q_values = self.policy_net(state, mask)
-
-                # Track average Q-values for monitoring
-                if len(self.training_stats['avg_q_values']) < 1000:
-                    self.training_stats['avg_q_values'].append(q_values.max().item())
-                else:
-                    self.training_stats['avg_q_values'] = self.training_stats['avg_q_values'][1:] + [q_values.max().item()]
-
-                # Get the action with highest Q-value
                 action_idx = q_values.max(1)[1].item()
-
-                # Convert action index to chess move
-                from_square = action_idx // 64
-                to_square = action_idx % 64
-
-                # Check if this is a legal move
-                move = chess.Move(from_square, to_square)
-
-                # Handle promotion
-                piece = board.piece_at(from_square)
-                if piece and piece.piece_type == chess.PAWN:
-                    if board.turn == chess.WHITE and chess.square_rank(to_square) == 7:
-                        move.promotion = chess.QUEEN
-                    elif board.turn == chess.BLACK and chess.square_rank(to_square) == 0:
-                        move.promotion = chess.QUEEN
-
-                # If move is not legal, choose a legal move with highest Q-value
-                if move not in board.legal_moves:
-                    legal_moves = list(board.legal_moves)
-                    legal_move_indices = [m.from_square * 64 + m.to_square for m in legal_moves]
-
-                    # Get Q-values for legal moves only
-                    legal_q_values = q_values[0, legal_move_indices]
-                    best_legal_idx = torch.argmax(legal_q_values).item()
-                    move = legal_moves[best_legal_idx]
-                    action_idx = legal_move_indices[best_legal_idx]
+                move = self._convert_action_to_move(action_idx, board)
         else:
-            # Choose a random legal move
-            legal_moves = list(board.legal_moves)
-            move = random.choice(legal_moves)
+            move = self._select_random_move(board)
             action_idx = move.from_square * 64 + move.to_square
 
         return action_idx, move
 
+    def _get_adaptive_epsilon(self):
+        """
+        Get adaptive epsilon value based on training progress.
+        
+        Returns:
+            float: Epsilon value
+        """
+        base_eps = self.eps_end + (self.eps_start - self.eps_end) * \
+                   np.exp(-1. * self.steps_done / self.eps_decay)
+        
+        # Adjust epsilon based on recent performance
+        if len(self.training_stats['win_rates']) > 100:
+            recent_win_rate = np.mean(self.training_stats['win_rates'][-100:])
+            if recent_win_rate < 0.4:  # Poor performance
+                return min(base_eps * 1.2, self.eps_start)  # Increase exploration
+            elif recent_win_rate > 0.6:  # Good performance
+                return max(base_eps * 0.8, self.eps_end)  # Decrease exploration
+        
+        return base_eps
+
     def optimize_model(self):
-        """Perform one step of optimization with prioritized experience replay"""
+        """
+        Perform one step of optimization with improved batch processing.
+        
+        Returns:
+            float: Loss value
+        """
         if len(self.memory) < self.batch_size:
-            return
+            return None
 
         # Sample a batch from prioritized memory
         experiences, indices, weights = self.memory.sample(self.batch_size)
@@ -231,14 +271,12 @@ class ChessTrainerWithStockfish:
 
         # Compute Q-values for current states
         q_values = self.policy_net(state_batch, mask_batch)
-
-        # Get Q-values for chosen actions
         state_action_values = q_values.gather(1, action_batch)
 
         # Compute V(s_{t+1}) for all next states using target network
         next_state_values = torch.zeros(self.batch_size, device=self.device)
         with torch.no_grad():
-            if non_final_mask.sum() > 0:  # Check if there are any non-final states
+            if non_final_mask.sum() > 0:
                 next_q_values = self.target_net(non_final_next_states, non_final_next_masks)
                 next_state_values[non_final_mask] = next_q_values.max(1)[0]
 
@@ -249,7 +287,7 @@ class ChessTrainerWithStockfish:
         td_errors = torch.abs(state_action_values.squeeze() - expected_state_action_values).detach().cpu().numpy()
 
         # Update priorities in memory
-        self.memory.update_priorities(indices, td_errors + 1e-6)  # Small constant to avoid zero priority
+        self.memory.update_priorities(indices, td_errors + 1e-6)
 
         # Compute weighted loss
         criterion = nn.SmoothL1Loss(reduction='none')
@@ -268,57 +306,269 @@ class ChessTrainerWithStockfish:
         return loss.item()
 
     def calculate_stockfish_reward(self, board, prev_board=None):
-        """Calculate reward based on deeper Stockfish evaluation with more nuanced rewards"""
+        """
+        Calculate reward using enhanced Stockfish evaluation with improved parameters.
+        
+        Args:
+            board (chess.Board): Current board state
+            prev_board (chess.Board): Previous board state
+            
+        Returns:
+            float: Reward value
+        """
         if self.stockfish is None:
-            # Fallback to material advantage if Stockfish is not available
             return self.calculate_reward(board)
 
         try:
-            # Use deeper analysis for more accurate evaluation
-            current_score = self.stockfish.analyse(board=board, limit=chess.engine.Limit(depth=12))['score'].relative.score(mate_score=10000)
+            # Use appropriate depth based on game phase
+            depth = self._get_appropriate_depth(board)
+            current_score = self.stockfish.analyse(board=board, limit=chess.engine.Limit(depth=depth))['score'].relative.score(mate_score=10000)
 
-            # If we have a previous board, calculate the difference in evaluation
             if prev_board is not None:
-                prev_score = self.stockfish.analyse(board=prev_board, limit=chess.engine.Limit(depth=12))['score'].relative.score(mate_score=10000)
-
-                # More nuanced reward calculation
+                prev_score = self.stockfish.analyse(board=prev_board, limit=chess.engine.Limit(depth=depth))['score'].relative.score(mate_score=10000)
                 raw_diff = current_score - prev_score
-
-                # Scale reward based on magnitude of improvement
-                if abs(raw_diff) < 50:  # Small change
-                    reward = raw_diff / 100.0
-                elif abs(raw_diff) < 200:  # Medium change
-                    reward = raw_diff / 80.0
-                else:  # Large change (likely a blunder or brilliant move)
-                    reward = raw_diff / 50.0
-
-                # Small penalty for each move to encourage faster wins
-                reward -= 0.01
+                reward = self._scale_reward(raw_diff)
             else:
-                # If no previous board, just use the current evaluation
                 reward = current_score / 100.0
 
-            # Enhanced terminal state rewards
-            if board.is_checkmate():
-                reward = 10.0 if board.turn == chess.BLACK else -10.0  # Positive reward if white wins, negative if black wins
-            elif board.is_stalemate() or board.is_insufficient_material():
-                # Adjust draw reward based on position evaluation
-                if abs(current_score) < 50:  # Equal position
-                    reward = 0.0
-                elif current_score > 0:  # White was better
-                    reward = -0.5
-                else:  # Black was better
-                    reward = 0.5
-
-            # Add rewards for good chess principles
+            # Add positional bonuses
             reward += self.calculate_positional_bonus(board)
 
             return reward
 
         except Exception as e:
             print(f"Error calculating Stockfish reward: {e}")
-            # Fallback to material advantage
             return self.calculate_reward(board)
+
+    def _get_appropriate_depth(self, board):
+        """
+        Get appropriate Stockfish analysis depth based on game phase.
+        
+        Args:
+            board (chess.Board): Current board state
+            
+        Returns:
+            int: Analysis depth
+        """
+        move_count = len(board.move_stack)
+        if move_count < 10:  # Opening
+            return 8
+        elif move_count < 30:  # Middlegame
+            return 10
+        else:  # Endgame
+            return 12
+
+    def _scale_reward(self, raw_diff):
+        """
+        Scale reward based on magnitude of improvement.
+        
+        Args:
+            raw_diff (float): Raw score difference
+            
+        Returns:
+            float: Scaled reward
+        """
+        if abs(raw_diff) < 50:  # Small change
+            return raw_diff / 100.0
+        elif abs(raw_diff) < 200:  # Medium change
+            return raw_diff / 80.0
+        else:  # Large change
+            return raw_diff / 50.0
+
+    def test_model_strength(self, num_games=10):
+        """
+        Test the model against different Stockfish levels to determine its approximate strength.
+        
+        Args:
+            num_games (int): Number of games to play against each Stockfish level
+            
+        Returns:
+            int: Approximate Stockfish level of the model
+        """
+        print("\nTesting model strength against Stockfish levels...")
+        
+        # Store original Stockfish level
+        original_level = self.stockfish_level
+        
+        # Test against different Stockfish levels
+        for level in range(1, 21):
+            wins = 0
+            draws = 0
+            
+            print(f"\nTesting against Stockfish level {level}")
+            
+            for game in range(num_games):
+                board = chess.Board()
+                
+                # Configure Stockfish to current level
+                self.stockfish.configure({"Skill Level": level})
+                
+                while not board.is_game_over():
+                    if board.turn == chess.WHITE:
+                        # Model's move
+                        state = board_to_tensor(board)
+                        mask = create_move_mask(board).unsqueeze(0)
+                        action_idx, move = self.select_action(state, mask, board)
+                    else:
+                        # Stockfish's move
+                        result = self.stockfish.play(board, chess.engine.Limit(time=0.1))
+                        move = result.move
+                    
+                    board.push(move)
+                
+                # Record result
+                if board.is_checkmate():
+                    if board.turn == chess.BLACK:  # Model won
+                        wins += 1
+                        print(f"Game {game + 1}: Model won")
+                    else:
+                        print(f"Game {game + 1}: Stockfish won")
+                elif board.is_stalemate() or board.is_insufficient_material():
+                    draws += 1
+                    print(f"Game {game + 1}: Draw")
+                
+            # Calculate win rate
+            win_rate = (wins + 0.5 * draws) / num_games
+            print(f"Level {level} results: {wins} wins, {draws} draws, {num_games - wins - draws} losses")
+            print(f"Win rate: {win_rate:.2%}")
+            
+            # If win rate is close to 50%, we've found the model's strength level
+            if 0.45 <= win_rate <= 0.55:
+                print(f"\nModel strength is approximately at Stockfish level {level}")
+                # Restore original Stockfish level
+                self.stockfish.configure({"Skill Level": original_level})
+                return level
+            elif win_rate < 0.45:
+                print(f"\nModel strength is between Stockfish levels {level-1} and {level}")
+                # Restore original Stockfish level
+                self.stockfish.configure({"Skill Level": original_level})
+                return level-1
+        
+        print("\nModel strength is below Stockfish level 1")
+        # Restore original Stockfish level
+        self.stockfish.configure({"Skill Level": original_level})
+        return 0
+
+    def train_self_play(self, num_episodes=1000):
+        """
+        Train the model through enhanced self-play with curriculum learning.
+        
+        Args:
+            num_episodes (int): Number of episodes to train
+            
+        Returns:
+            tuple: (rewards, lengths, losses)
+        """
+        print(f"Starting enhanced self-play training with curriculum learning for {num_episodes} episodes...")
+
+        # Initialize tracking metrics
+        self._reset_training_stats()
+
+        # Curriculum learning parameters
+        curriculum_stages = [
+            {"max_moves": 20, "opponent_strength": 0.2},  # Opening
+            {"max_moves": 40, "opponent_strength": 0.4},  # Middlegame
+            {"max_moves": 60, "opponent_strength": 0.6},  # Endgame
+            {"max_moves": 100, "opponent_strength": 0.8}, # Full game
+        ]
+        current_stage = 0
+
+        for episode in range(num_episodes):
+            # Update curriculum stage
+            if episode > 0 and episode % 100 == 0 and current_stage < len(curriculum_stages) - 1:
+                current_stage += 1
+                print(f"Advancing to curriculum stage {current_stage + 1}")
+                
+                # Test model strength after each curriculum stage
+                print("\nTesting model strength after curriculum stage change...")
+                model_strength = self.test_model_strength(num_games=5)
+                print(f"Current model strength: Stockfish level {model_strength}")
+
+            # Get current curriculum parameters
+            stage_params = curriculum_stages[current_stage]
+            
+            # Train episode
+            episode_reward, episode_length = self._train_episode(stage_params)
+            
+            # Update training statistics
+            self._update_training_stats(episode_reward, episode_length)
+            
+            # Print progress
+            if (episode + 1) % 10 == 0:
+                self._print_training_progress(episode, num_episodes)
+            
+            # Save model periodically
+            if (episode + 1) % 100 == 0:
+                self._save_training_checkpoint(episode)
+                
+                # Test model strength periodically
+                print("\nTesting model strength at checkpoint...")
+                model_strength = self.test_model_strength(num_games=5)
+                print(f"Current model strength: Stockfish level {model_strength}")
+
+        # Final strength test
+        print("\nPerforming final strength test...")
+        final_strength = self.test_model_strength(num_games=10)
+        print(f"Final model strength: Stockfish level {final_strength}")
+
+        # Save final model
+        self.save_model("model_improved_final.pt")
+        print("Enhanced training completed!")
+
+        # Close Stockfish engine
+        if self.stockfish:
+            self.stockfish.quit()
+
+        return (self.training_stats['episode_rewards'],
+                self.training_stats['episode_lengths'],
+                self.training_stats['losses'])
+
+    def _reset_training_stats(self):
+        """Reset training statistics."""
+        self.training_stats = {
+            'episode_rewards': [],
+            'episode_lengths': [],
+            'losses': [],
+            'avg_q_values': [],
+            'win_rates': [],
+            'learning_rates': []
+        }
+
+    def _update_training_stats(self, episode_reward, episode_length):
+        """Update training statistics."""
+        self.training_stats['episode_rewards'].append(episode_reward)
+        self.training_stats['episode_lengths'].append(episode_length)
+        self.training_stats['learning_rates'].append(self.optimizer.param_groups[0]['lr'])
+
+    def _print_training_progress(self, episode, num_episodes):
+        """Print training progress with detailed metrics."""
+        avg_reward = np.mean(self.training_stats['episode_rewards'][-10:])
+        avg_length = np.mean(self.training_stats['episode_lengths'][-10:])
+        avg_loss = np.mean(self.training_stats['losses'][-100:]) if self.training_stats['losses'] else 0
+        current_lr = self.optimizer.param_groups[0]['lr']
+
+        print(f"Episode {episode+1}/{num_episodes}")
+        print(f"Average Reward: {avg_reward:.2f}")
+        print(f"Average Length: {avg_length:.2f}")
+        print(f"Average Loss: {avg_loss:.4f}")
+        print(f"Learning Rate: {current_lr:.6f}")
+        print(f"Epsilon: {self._get_adaptive_epsilon():.4f}")
+        print("-" * 50)
+
+    def _save_training_checkpoint(self, episode):
+        """Save training checkpoint."""
+        checkpoint = {
+            'episode': episode,
+            'model_state_dict': self.policy_net.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'training_stats': self.training_stats
+        }
+        torch.save(checkpoint, os.path.join(self.model_dir, f"checkpoint_episode_{episode}.pt"))
+
+    def __del__(self):
+        """Cleanup resources when the trainer is destroyed."""
+        if hasattr(self, 'stockfish') and self.stockfish:
+            self.stockfish.quit()
 
     def calculate_positional_bonus(self, board):
         """Calculate bonus rewards for good chess principles"""
@@ -415,330 +665,6 @@ class ChessTrainerWithStockfish:
 
         # Combine factors
         return center_control + 0.1 * mobility
-
-    def train_self_play(self, num_episodes=1000):
-        """Train the model through enhanced self-play with curriculum learning"""
-        print(f"Starting enhanced self-play training with curriculum learning for {num_episodes} episodes...")
-
-        # Initialize tracking metrics
-        self.training_stats['episode_rewards'] = []
-        self.training_stats['episode_lengths'] = []
-        self.training_stats['losses'] = []
-
-        # Curriculum learning - gradually increase opponent strength
-        opponent_strength = 0.1  # Start with weak opponent
-
-        # Track best model for opponent
-        best_reward = float('-inf')
-        best_model_path = os.path.join(self.model_dir, "best_model.pt")
-
-        for episode in range(num_episodes):
-            # Increase opponent strength over time
-            if episode > 0 and episode % 100 == 0 and opponent_strength < 1.0:
-                opponent_strength += 0.1
-                print(f"Increasing opponent strength to {opponent_strength:.1f}")
-
-                # Save current model as opponent model
-                if os.path.exists(best_model_path):
-                    opponent_model = DQN()
-                    opponent_model.load_state_dict(torch.load(best_model_path))
-                    opponent_model.eval()
-                else:
-                    # Use current model as opponent if no best model exists
-                    opponent_model = self.policy_net
-            else:
-                # Use current model as opponent
-                opponent_model = self.policy_net
-
-            # Initialize the environment
-            board = chess.Board()
-            episode_reward = 0
-            episode_length = 0
-
-            # Get initial state
-            state = board_to_tensor(board)
-            mask = create_move_mask(board).unsqueeze(0)
-
-            # Track positions seen in this game to avoid repetitions
-            positions_seen = {}
-
-            done = False
-            while not done:
-                # Store the current board for reward calculation
-                prev_board = board.copy()
-
-                # Select and perform an action
-                action_idx, move = self.select_action(state, mask, board)
-
-                # Execute the move
-                board.push(move)
-
-                # Get the next state
-                next_state = board_to_tensor(board)
-                next_mask = create_move_mask(board).unsqueeze(0)
-
-                # Calculate reward using enhanced Stockfish evaluation
-                reward = self.calculate_stockfish_reward(board, prev_board)
-
-                # Check if the game is over
-                done = board.is_game_over()
-
-                # Detect repetitions and penalize
-                board_fen = board.fen().split(' ')[0]  # Just the piece positions
-                if board_fen in positions_seen:
-                    positions_seen[board_fen] += 1
-                    # Apply increasingly severe penalties for repetitions
-                    if positions_seen[board_fen] == 2:
-                        # Second occurrence (first repetition)
-                        reward -= 1.0
-                    elif positions_seen[board_fen] >= 3:
-                        # Third occurrence (threefold repetition)
-                        reward -= 3.0
-                        done = True  # End the game to avoid infinite loops
-                else:
-                    positions_seen[board_fen] = 1
-
-                # Store the transition in memory
-                self.memory.push(state, action_idx, next_state, reward, done, mask, next_mask)
-
-                # Move to the next state
-                state = next_state
-                mask = next_mask
-
-                # Perform one step of optimization
-                loss = self.optimize_model()
-                if loss is not None:
-                    self.training_stats['losses'].append(loss)
-
-                episode_reward += reward
-                episode_length += 1
-
-                # Limit episode length to avoid very long games
-                if episode_length >= 300:  # Increased from 200 to allow longer games
-                    done = True
-
-            # Update the target network
-            if episode % self.target_update == 0:
-                self.target_net.load_state_dict(self.policy_net.state_dict())
-
-            # Step the learning rate scheduler
-            self.scheduler.step()
-
-            self.training_stats['episode_rewards'].append(episode_reward)
-            self.training_stats['episode_lengths'].append(episode_length)
-
-            # Track best model
-            if episode_reward > best_reward:
-                best_reward = episode_reward
-                torch.save(self.policy_net.state_dict(), best_model_path)
-                print(f"New best model saved with reward: {best_reward:.2f}")
-
-            # Print progress with more detailed metrics
-            if (episode + 1) % 10 == 0:
-                avg_reward = sum(self.training_stats['episode_rewards'][-10:]) / 10
-                avg_length = sum(self.training_stats['episode_lengths'][-10:]) / 10
-                avg_loss = sum(self.training_stats['losses'][-100:]) / max(len(self.training_stats['losses'][-100:]), 1)
-                avg_q = sum(self.training_stats['avg_q_values'][-100:]) / max(len(self.training_stats['avg_q_values'][-100:]), 1)
-
-                print(f"Episode {episode+1}/{num_episodes} | Avg Reward: {avg_reward:.2f} | "
-                      f"Avg Length: {avg_length:.2f} | Avg Loss: {avg_loss:.4f} | "
-                      f"Avg Q-Value: {avg_q:.4f} | LR: {self.scheduler.get_last_lr()[0]:.6f}")
-
-            # Save model periodically
-            if (episode + 1) % 100 == 0:
-                self.save_model(f"model_improved_episode_{episode+1}.pt")
-
-                # Plot training progress
-                self.plot_training_progress()
-
-        # Save final model
-        self.save_model("model_improved_final.pt")
-        print("Enhanced training completed!")
-
-        # Close Stockfish engine
-        if self.stockfish:
-            self.stockfish.quit()
-
-        return (self.training_stats['episode_rewards'],
-                self.training_stats['episode_lengths'],
-                self.training_stats['losses'])
-
-    def plot_training_progress(self):
-        """Plot training progress metrics"""
-        try:
-            import matplotlib.pyplot as plt
-
-            # Create figure with subplots
-            _, axs = plt.subplots(4, 1, figsize=(10, 15))  # Use _ for unused figure variable
-
-            # Plot episode rewards
-            axs[0].plot(self.training_stats['episode_rewards'])
-            axs[0].set_title('Episode Rewards')
-            axs[0].set_xlabel('Episode')
-            axs[0].set_ylabel('Reward')
-
-            # Plot episode lengths
-            axs[1].plot(self.training_stats['episode_lengths'])
-            axs[1].set_title('Episode Lengths')
-            axs[1].set_xlabel('Episode')
-            axs[1].set_ylabel('Length')
-
-            # Plot losses
-            if self.training_stats['losses']:
-                axs[2].plot(self.training_stats['losses'])
-                axs[2].set_title('Training Loss')
-                axs[2].set_xlabel('Optimization Step')
-                axs[2].set_ylabel('Loss')
-
-            # Plot average Q-values
-            if self.training_stats['avg_q_values']:
-                axs[3].plot(self.training_stats['avg_q_values'])
-                axs[3].set_title('Average Q-Values')
-                axs[3].set_xlabel('Step')
-                axs[3].set_ylabel('Q-Value')
-
-            plt.tight_layout()
-            plt.savefig(os.path.join(self.model_dir, 'training_progress.png'))
-            plt.close()
-
-            print("Training progress plot saved to training_progress.png")
-        except Exception as e:
-            print(f"Error plotting training progress: {e}")
-            # Continue without plotting if matplotlib is not available
-
-    def train_from_pgn(self, pgn_path, num_games=1000):
-        """Train the model from PGN games with Stockfish evaluation
-
-        Args:
-            pgn_path: Path to a PGN file or directory containing PGN files
-            num_games: Maximum number of games to process
-        """
-        game_count = 0
-        losses = []
-
-        # Check if pgn_path is a directory
-        if os.path.isdir(pgn_path):
-            print(f"Training from PGN files in directory: {pgn_path}")
-            # Get all PGN files in the directory
-            pgn_files = [os.path.join(pgn_path, f) for f in os.listdir(pgn_path)
-                        if f.endswith('.pgn') and os.path.isfile(os.path.join(pgn_path, f))]
-
-            if not pgn_files:
-                print(f"No PGN files found in directory: {pgn_path}")
-                return losses
-
-            print(f"Found {len(pgn_files)} PGN files")
-
-            # Process each PGN file
-            for pgn_file in sorted(pgn_files):
-                if game_count >= num_games:
-                    break
-
-                print(f"Processing file: {os.path.basename(pgn_file)}")
-                file_losses = self._process_pgn_file(pgn_file, game_count, num_games - game_count)
-                losses.extend(file_losses)
-
-                # Update game count
-                game_count += len(file_losses)
-
-                # Save model after each file
-                self.save_model(f"model_pgn_checkpoint.pt")
-        else:
-            # Process a single PGN file
-            print(f"Training from PGN file: {pgn_path}")
-            file_losses = self._process_pgn_file(pgn_path, 0, num_games)
-            losses.extend(file_losses)
-            game_count = len(file_losses)
-
-        # Save final model
-        self.save_model("model_pgn_final.pt")
-        print(f"PGN training completed! Processed {game_count} games.")
-
-        return losses
-
-    def _process_pgn_file(self, pgn_file, start_count, max_games):
-        """Process a single PGN file for training
-
-        Args:
-            pgn_file: Path to the PGN file
-            start_count: Starting game count
-            max_games: Maximum number of games to process
-
-        Returns:
-            List of losses from training
-        """
-        losses = []
-        game_count = 0
-
-        try:
-            with open(pgn_file) as f:
-                while game_count < max_games:
-                    # Read the next game
-                    game = chess.pgn.read_game(f)
-                    if game is None:
-                        break  # End of file
-
-                    # Process the game
-                    board = game.board()
-                    moves = list(game.mainline_moves())
-
-                    # Skip very short games
-                    if len(moves) < 10:
-                        continue
-
-                    # Process each position in the game
-                    prev_board = None
-                    for i, move in enumerate(moves):
-                        # Get current state
-                        state = board_to_tensor(board)
-                        mask = create_move_mask(board).unsqueeze(0)
-
-                        # Store current board for reward calculation
-                        prev_board = board.copy()
-
-                        # Convert move to action index
-                        action_idx = move.from_square * 64 + move.to_square
-
-                        # Make the move
-                        board.push(move)
-
-                        # Get next state
-                        next_state = board_to_tensor(board)
-                        next_mask = create_move_mask(board).unsqueeze(0)
-
-                        # Calculate reward using Stockfish
-                        reward = self.calculate_stockfish_reward(board, prev_board)
-
-                        # Check if game is over
-                        done = board.is_game_over()
-
-                        # Store transition in memory
-                        self.memory.push(state, action_idx, next_state, reward, done, mask, next_mask)
-
-                        # Perform optimization step if enough samples
-                        if len(self.memory) >= self.batch_size:
-                            loss = self.optimize_model()
-                            if loss is not None:
-                                losses.append(loss)
-
-                    game_count += 1
-
-                    # Update target network periodically
-                    if (start_count + game_count) % self.target_update == 0:
-                        self.target_net.load_state_dict(self.policy_net.state_dict())
-
-                    # Print progress
-                    if game_count % 10 == 0:
-                        avg_loss = sum(losses[-100:]) / max(len(losses[-100:]), 1)
-                        print(f"Processed {start_count + game_count} games | Avg Loss: {avg_loss:.4f}")
-
-                    # Save model periodically
-                    if (start_count + game_count) % 100 == 0:
-                        self.save_model(f"model_pgn_{start_count + game_count}.pt")
-        except Exception as e:
-            print(f"Error processing file {pgn_file}: {e}")
-
-        return losses
 
     def save_model(self, filename):
         """Save the model to disk"""
