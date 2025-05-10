@@ -129,6 +129,153 @@ strength = trainer.test_model_strength(num_games=10)
 print(f"Model strength: Stockfish level {strength}")
 ```
 
+## How to Run
+
+### 1. Setup
+
+1. **Install Dependencies**
+   ```bash
+   pip install torch python-chess numpy matplotlib
+   ```
+
+2. **Install Stockfish**
+   - macOS: `brew install stockfish`
+   - Ubuntu/Debian: `sudo apt-get install stockfish`
+   - Windows: Download from [Stockfish website](https://stockfishchess.org/download/)
+
+3. **Prepare Training Data**
+   - Create a `data` directory
+   - Add PGN files to the `data` directory
+   - Recommended: Use high-quality games from [Lichess Elite Database](https://database.nikonoel.fr/)
+
+### 2. Training Process
+
+1. **Initial PGN Training**
+   ```python
+   # Initialize trainer
+   trainer = ChessTrainerWithStockfish(
+       model_dir="models",
+       stockfish_path="/path/to/stockfish",  # Update with your Stockfish path
+       stockfish_level=8
+   )
+
+   # Train on PGN data first
+   print("Starting PGN training phase...")
+   trainer.train_from_pgn("data/", num_games=100)
+   ```
+
+2. **Self-Play Training**
+   ```python
+   # Continue with self-play training
+   print("\nStarting self-play training phase...")
+   rewards, lengths, losses = trainer.train_self_play(num_episodes=1000)
+   ```
+
+3. **Monitor Training**
+   - Check the console output for:
+     - Episode rewards
+     - Game lengths
+     - Model strength level
+     - Learning rate changes
+   - View training progress plots in the `models` directory
+
+### 3. Testing the Model
+
+1. **Test Model Strength**
+   ```python
+   # Test against different Stockfish levels
+   strength = trainer.test_model_strength(num_games=10)
+   print(f"Model strength: Stockfish level {strength}")
+   ```
+
+2. **Play Against the Model**
+   ```python
+   # Load the trained model
+   agent = ChessAgent(model_path="models/model_improved_final.pt")
+   
+   # Play a game
+   board = chess.Board()
+   while not board.is_game_over():
+       if board.turn == chess.WHITE:
+           # Your move
+           move = input("Enter your move (e.g., e2e4): ")
+           board.push(chess.Move.from_uci(move))
+       else:
+           # Model's move
+           move = agent.select_move(board)
+           board.push(move)
+           print(f"Model played: {move.uci()}")
+       print(board)
+   ```
+
+### 4. Training Parameters
+
+You can adjust these parameters in `train_model_stockfish.py`:
+
+```python
+# Training parameters
+BATCH_SIZE = 1024
+LEARNING_RATE = 0.001
+MEMORY_SIZE = 100000
+TARGET_UPDATE = 50
+EPSILON_START = 1.0
+EPSILON_END = 0.05
+EPSILON_DECAY = 10000
+
+# Curriculum stages
+CURRICULUM_STAGES = [
+    {"max_moves": 20, "opponent_strength": 0.2},  # Opening
+    {"max_moves": 40, "opponent_strength": 0.4},  # Middlegame
+    {"max_moves": 60, "opponent_strength": 0.6},  # Endgame
+    {"max_moves": 100, "opponent_strength": 0.8}, # Full game
+]
+```
+
+### 5. Expected Training Time
+
+- PGN Training: 1-2 hours (100 games)
+- Self-Play Training: 5-10 hours (1000 episodes)
+- Total: 6-12 hours
+
+### 6. Monitoring Progress
+
+1. **Console Output**
+   ```
+   Episode 100/1000 | Avg Reward: 0.45 | Avg Length: 35.2 | Avg Loss: 0.0234
+   Current model strength: Stockfish level 4
+   Learning Rate: 0.000800
+   ```
+
+2. **Training Plots**
+   - Check `models/training_progress.png`
+   - Shows rewards, lengths, losses, and Q-values
+
+3. **Model Checkpoints**
+   - Saved every 100 episodes
+   - Located in `models/` directory
+   - Format: `checkpoint_episode_X.pt`
+
+### 7. Troubleshooting Common Issues
+
+1. **Out of Memory**
+   ```python
+   # Reduce batch size and memory size
+   BATCH_SIZE = 512
+   MEMORY_SIZE = 50000
+   ```
+
+2. **Slow Training**
+   ```python
+   # Enable GPU if available
+   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+   ```
+
+3. **Poor Performance**
+   ```python
+   # Adjust Stockfish level
+   trainer = ChessTrainerWithStockfish(stockfish_level=6)  # Start with lower level
+   ```
+
 ## Performance Expectations
 
 1. **Initial Stage**
