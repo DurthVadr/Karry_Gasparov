@@ -8,6 +8,7 @@ at different skill levels.
 import os
 import chess
 import chess.engine
+import torch
 from drl_agent import ChessAgent
 
 class ModelEvaluator:
@@ -18,15 +19,21 @@ class ModelEvaluator:
     chess models against Stockfish at various skill levels.
     """
 
-    def __init__(self, stockfish_path=None):
+    def __init__(self, stockfish_path=None, use_fp16=True):
         """
         Initialize the model evaluator.
 
         Args:
             stockfish_path (str, optional): Path to Stockfish executable
+            use_fp16 (bool, optional): Whether to use FP16 precision for model inference
         """
         self.stockfish_path = stockfish_path
         self.stockfish = None
+
+        # Set up mixed precision evaluation
+        self.use_fp16 = use_fp16 and torch.cuda.is_available()
+        if self.use_fp16:
+            print("Using FP16 precision for model evaluation")
 
         # Initialize Stockfish engine if path is provided
         if stockfish_path:
@@ -55,8 +62,8 @@ class ModelEvaluator:
             print(f"Model file {model_path} not found")
             return None
 
-        # Create a chess agent with the model
-        agent = ChessAgent(model_path=model_path)
+        # Create a chess agent with the model, using FP16 if enabled
+        agent = ChessAgent(model_path=model_path, use_fp16=self.use_fp16)
 
         # Initialize results dictionary
         results = {}

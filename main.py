@@ -3,6 +3,13 @@ Main script for chess reinforcement learning with Stockfish evaluation.
 
 This script provides a command-line interface for training and evaluating
 chess models using deep reinforcement learning with Stockfish evaluation.
+
+Features:
+- Training from PGN files with optimized batch processing
+- Self-play training with curriculum learning
+- Evaluation against Stockfish at different levels
+- Loading pre-trained models to continue training
+- Mixed precision training for GPU acceleration
 """
 
 import os
@@ -13,6 +20,9 @@ import torch
 import chess
 import argparse
 
+# Import torch.amp for mixed precision training
+from torch.amp import autocast, GradScaler
+
 # Import custom modules
 from drl_agent import DQN, ChessAgent, board_to_tensor, create_move_mask
 from memory import PrioritizedReplayMemory, Experience
@@ -20,6 +30,7 @@ from reward import RewardCalculator
 from evaluation import ModelEvaluator
 from visualization import plot_training_progress, plot_evaluation_results
 from training import PGNTrainer, SelfPlayTrainer
+from hyperparameters import get_optimized_hyperparameters
 
 class ChessTrainer:
     """
@@ -33,14 +44,19 @@ class ChessTrainer:
     - Model evaluation
     """
 
-    def __init__(self, model_dir="models", stockfish_path=None):
+    def __init__(self, model_dir="models", stockfish_path=None, gpu_type="rtx_4070"):
         """
-        Initialize the chess trainer.
+        Initialize the chess trainer with optimized hyperparameters.
 
         Args:
             model_dir (str): Directory for saving models
             stockfish_path (str, optional): Path to Stockfish executable
+            gpu_type (str, optional): GPU type to optimize for
         """
+        # Get optimized hyperparameters for the current hardware
+        self.hyperparams = get_optimized_hyperparameters(gpu_type)
+        print(f"Using optimized hyperparameters for {gpu_type}")
+
         # Create model directory if it doesn't exist
         if not os.path.exists(model_dir):
             os.makedirs(model_dir)
@@ -52,39 +68,94 @@ class ChessTrainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
 
+        # Initialize mixed precision training components if CUDA is available
+        self.use_mixed_precision = torch.cuda.is_available() and self.hyperparams['mixed_precision']['enabled']
+        if self.use_mixed_precision:
+            self.scaler = GradScaler()
+            # Set default tensor type to float16 for mixed precision training
+            self.fp16_enabled = True
+            print("Using mixed precision FP16 training for better performance on RTX 4070")
+        else:
+            self.fp16_enabled = False
+
         # Initialize networks
         self.policy_net = DQN().to(self.device)
         self.target_net = DQN().to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()  # Target network is only used for inference
 
-        # Initialize optimizer with higher learning rate
-        self.optimizer = torch.optim.Adam(self.policy_net.parameters(), lr=0.001)
+        # Initialize optimizer with optimized parameters
+        lr = self.hyperparams['optimizer']['learning_rate']
+        weight_decay = self.hyperparams['optimizer']['weight_decay']
+        self.optimizer = torch.optim.Adam(
+            self.policy_net.parameters(),
+            lr=lr,
+            weight_decay=weight_decay
+        )
 
-        # Add learning rate scheduler
-        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=100, gamma=0.5)
+        # Initialize learning rate scheduler based on hyperparameters
+        scheduler_type = self.hyperparams['optimizer']['lr_scheduler']
+        if scheduler_type == 'plateau':
+            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode='min',
+                factor=self.hyperparams['optimizer']['lr_factor'],
+                patience=self.hyperparams['optimizer']['lr_patience'],
+                verbose=True,
+                min_lr=self.hyperparams['optimizer']['lr_min']
+            )
+        elif scheduler_type == 'step':
+            self.scheduler = torch.optim.lr_scheduler.StepLR(
+                self.optimizer,
+                step_size=5000,
+                gamma=self.hyperparams['optimizer']['lr_factor']
+            )
+        elif scheduler_type == 'cosine':
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=100000,
+                eta_min=self.hyperparams['optimizer']['lr_min']
+            )
 
-        # Initialize prioritized replay memory with larger capacity
-        self.memory = PrioritizedReplayMemory(100000)
+        # Initialize prioritized replay memory with optimized capacity
+        memory_capacity = self.hyperparams['memory']['capacity']
+        memory_alpha = self.hyperparams['memory']['alpha']
+        memory_beta_start = self.hyperparams['memory']['beta_start']
+        self.memory = PrioritizedReplayMemory(
+            capacity=memory_capacity,
+            alpha=memory_alpha,
+            beta_start=memory_beta_start
+        )
 
-        # Initialize reward calculator
-        self.reward_calculator = RewardCalculator(stockfish_path)
+        # Initialize reward calculator with asynchronous evaluation
+        self.reward_calculator = RewardCalculator(
+            stockfish_path=stockfish_path,
+            use_async=True,
+            num_workers=4  # Use 4 worker threads for parallel evaluation
+        )
 
         # Initialize model evaluator
-        self.model_evaluator = ModelEvaluator(stockfish_path)
+        self.model_evaluator = ModelEvaluator(
+            stockfish_path=stockfish_path,
+            use_fp16=self.fp16_enabled
+        )
 
         # Initialize trainers
         self.pgn_trainer = PGNTrainer(self)
         self.self_play_trainer = SelfPlayTrainer(self)
 
-        # Improved training parameters
-        self.batch_size = 256  # Larger batch size
-        self.gamma = 0.99  # Discount factor
-        self.eps_start = 1.0  # Start with full exploration
-        self.eps_end = 0.05
-        self.eps_decay = 10000  # Slower decay for better exploration
-        self.target_update = 50  # Less frequent target network updates
+        # Training parameters from hyperparameters
+        self.batch_size = self.hyperparams['optimizer']['batch_size']
+        self.gamma = self.hyperparams['reward']['gamma']
+        self.eps_start = self.hyperparams['exploration']['eps_start']
+        self.eps_end = self.hyperparams['exploration']['eps_end']
+        self.eps_decay = self.hyperparams['exploration']['eps_decay']
+        self.target_update = self.hyperparams['self_play']['target_update']
 
+        # Set gradient clipping threshold from hyperparameters
+        self.gradient_clip = self.hyperparams['optimizer']['gradient_clip']
+
+        # Initialize step counter
         self.steps_done = 0
 
         # Track metrics for monitoring
@@ -161,20 +232,49 @@ class ChessTrainer:
 
     def load_model(self, filename):
         """
-        Load a model from disk.
+        Load a model from disk to continue training from a saved checkpoint.
+
+        This method loads a previously saved model state and configures both the policy
+        and target networks to continue training from where it left off. It handles
+        device compatibility (CPU/GPU) automatically.
+
+        Usage examples:
+            # Load from models directory
+            trainer.load_model("model_pgn_checkpoint.pt")
+
+            # Load from absolute path
+            trainer.load_model("/path/to/model_self_play_episode_1000.pt")
 
         Args:
             filename (str): Name of the file to load the model from
+                If filename is a full path, it will be used directly
+                If filename is just a name, it will be looked for in the model_dir
 
         Returns:
             bool: True if model was loaded successfully, False otherwise
         """
-        filepath = os.path.join(self.model_dir, filename)
+        # Check if filename is a full path or just a filename
+        if os.path.dirname(filename):
+            filepath = filename  # Use the provided path directly
+        else:
+            filepath = os.path.join(self.model_dir, filename)  # Look in model_dir
+
         if os.path.exists(filepath):
-            self.policy_net.load_state_dict(torch.load(filepath))
-            self.target_net.load_state_dict(self.policy_net.state_dict())
-            print(f"Model loaded from {filepath}")
-            return True
+            try:
+                # Load state dict with appropriate device mapping
+                state_dict = torch.load(filepath, map_location=self.device)
+                self.policy_net.load_state_dict(state_dict)
+                self.target_net.load_state_dict(self.policy_net.state_dict())
+
+                # Make sure models are on the correct device
+                self.policy_net.to(self.device)
+                self.target_net.to(self.device)
+
+                print(f"Model loaded from {filepath} to {self.device}")
+                return True
+            except Exception as e:
+                print(f"Error loading model from {filepath}: {e}")
+                return False
         else:
             print(f"Model file {filepath} not found")
             return False
@@ -202,8 +302,18 @@ class ChessTrainer:
 
         if sample > eps_threshold:
             with torch.no_grad():
-                # Use policy network to select best action
-                q_values = self.policy_net(state, mask)
+                # Use policy network to select best action with FP16 if enabled
+                if self.use_mixed_precision and self.fp16_enabled:
+                    # Convert to FP16 for inference
+                    state_fp16 = state.to(dtype=torch.float16)
+                    mask_fp16 = mask.to(dtype=torch.float16)
+
+                    # Use autocast for mixed precision inference
+                    with autocast():
+                        q_values = self.policy_net(state_fp16, mask_fp16)
+                else:
+                    # Standard full precision inference
+                    q_values = self.policy_net(state, mask)
 
                 # Track average Q-values for monitoring
                 if len(self.training_stats['avg_q_values']) < 1000:
@@ -272,14 +382,47 @@ class ChessTrainer:
         weights = torch.tensor(weights, dtype=torch.float32).to(self.device)
 
         # Compute Q(s_t, a) - the model computes Q(s_t), then we select the columns of actions taken
-        state_action_values = self.policy_net(state_batch, mask_batch).gather(1, action_batch)
+        # Use mixed precision for forward pass if available
+        if self.use_mixed_precision:
+            # Convert input tensors to FP16 for mixed precision training
+            if self.fp16_enabled:
+                # Convert state and mask tensors to float16 for forward pass
+                state_batch_fp16 = state_batch.to(dtype=torch.float16)
+                mask_batch_fp16 = mask_batch.to(dtype=torch.float16)
+                next_state_batch_fp16 = next_state_batch.to(dtype=torch.float16)
+                next_mask_batch_fp16 = next_mask_batch.to(dtype=torch.float16)
 
-        # Compute V(s_{t+1}) for all next states
-        with torch.no_grad():
-            next_q_values = self.target_net(next_state_batch, next_mask_batch)
-            next_state_values = next_q_values.max(1)[0]
-            # Set V(s) = 0 for terminal states
-            next_state_values[done_batch] = 0.0
+                with autocast():
+                    # Forward pass with FP16 tensors
+                    state_action_values = self.policy_net(state_batch_fp16, mask_batch_fp16).gather(1, action_batch)
+
+                    # Compute V(s_{t+1}) for all next states
+                    with torch.no_grad():
+                        next_q_values = self.target_net(next_state_batch_fp16, next_mask_batch_fp16)
+                        next_state_values = next_q_values.max(1)[0]
+                        # Set V(s) = 0 for terminal states
+                        next_state_values[done_batch] = 0.0
+            else:
+                # Use autocast without explicit conversion
+                with autocast():
+                    state_action_values = self.policy_net(state_batch, mask_batch).gather(1, action_batch)
+
+                    # Compute V(s_{t+1}) for all next states
+                    with torch.no_grad():
+                        next_q_values = self.target_net(next_state_batch, next_mask_batch)
+                        next_state_values = next_q_values.max(1)[0]
+                        # Set V(s) = 0 for terminal states
+                        next_state_values[done_batch] = 0.0
+        else:
+            # Standard full precision forward pass
+            state_action_values = self.policy_net(state_batch, mask_batch).gather(1, action_batch)
+
+            # Compute V(s_{t+1}) for all next states
+            with torch.no_grad():
+                next_q_values = self.target_net(next_state_batch, next_mask_batch)
+                next_state_values = next_q_values.max(1)[0]
+                # Set V(s) = 0 for terminal states
+                next_state_values[done_batch] = 0.0
 
         # Compute the expected Q values
         expected_state_action_values = (next_state_values * self.gamma) + reward_batch
@@ -295,14 +438,28 @@ class ChessTrainer:
         elementwise_loss = criterion(state_action_values, expected_state_action_values.unsqueeze(1))
         loss = (elementwise_loss * weights.unsqueeze(1)).mean()
 
-        # Optimize the model
+        # Optimize the model with mixed precision if available
         self.optimizer.zero_grad()
-        loss.backward()
 
-        # Clip gradients to stabilize training
-        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 10.0)
+        if self.use_mixed_precision:
+            # Use mixed precision training
+            self.scaler.scale(loss).backward()
 
-        self.optimizer.step()
+            # Improved gradient clipping for better stability with mixed precision
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), self.gradient_clip)
+
+            # Update weights with scaled gradients
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            # Standard full precision training
+            loss.backward()
+
+            # Improved gradient clipping for better stability
+            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), self.gradient_clip)
+
+            self.optimizer.step()
 
         return loss.item()
 
@@ -334,6 +491,7 @@ def main():
     parser.add_argument("--eval_model", help="Path to specific model to evaluate (optional)")
     parser.add_argument("--min_level", type=int, default=1, help="Minimum Stockfish level to test against")
     parser.add_argument("--max_level", type=int, default=10, help="Maximum Stockfish level to test against")
+    parser.add_argument("--load_model", help="Path to a model file to load before training (to continue training)")
 
     args = parser.parse_args()
 
@@ -343,6 +501,7 @@ def main():
     print(f"Maximum games: {args.num_games}")
     print(f"Batch size: {args.batch_size}")
     print(f"Save interval: {args.save_interval}")
+    print(f"Continue training from model: {args.load_model if args.load_model else 'No (starting fresh)'}")
     print(f"Self-play training: {'Yes' if args.self_play else 'No'}")
     if args.self_play:
         print(f"Self-play episodes: {args.self_play_episodes}")
@@ -353,8 +512,16 @@ def main():
     print(f"Stockfish path: {args.stockfish_path}")
     print("==========================================\n")
 
-    # Create trainer
-    trainer = ChessTrainer(stockfish_path=args.stockfish_path)
+    # Create trainer with optimized hyperparameters for RTX 4070
+    trainer = ChessTrainer(stockfish_path=args.stockfish_path, gpu_type="rtx_4070")
+
+    # Load model if specified (to continue training from a saved model)
+    if args.load_model:
+        print(f"\nLoading model from {args.load_model} to continue training...")
+        if trainer.load_model(args.load_model):
+            print("Model loaded successfully. Training will continue from this model.")
+        else:
+            print("Failed to load model. Training will start with a new model.")
 
     # Train from high-quality PGN data
     if os.path.exists(args.data_dir):

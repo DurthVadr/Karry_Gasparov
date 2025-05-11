@@ -33,6 +33,69 @@ class MaskLayer(nn.Module):
         masked_output = x.masked_fill(mask_reshaped == 0, -float("inf"))
         return masked_output
 
+# Self-Attention Module for capturing long-range piece interactions
+class SelfAttention(nn.Module):
+    """
+    Self-attention module for capturing long-range piece interactions on the chess board.
+
+    This module implements a simplified version of the attention mechanism from the
+    Transformer architecture, allowing the model to focus on relevant parts of the board
+    and capture complex piece relationships.
+    """
+    def __init__(self, in_channels, key_dim=32):
+        super(SelfAttention, self).__init__()
+        self.key_dim = key_dim
+
+        # Projections for query, key, and value
+        self.query = nn.Conv2d(in_channels, key_dim, kernel_size=1)
+        self.key = nn.Conv2d(in_channels, key_dim, kernel_size=1)
+        self.value = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+
+        # Output projection
+        self.out_proj = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+
+        # Layer normalization for stability
+        self.norm = nn.LayerNorm([in_channels, 8, 8])
+
+        # Scaling factor for dot product attention
+        self.scale = torch.sqrt(torch.tensor(key_dim, dtype=torch.float32))
+
+    def forward(self, x):
+        # Apply layer normalization
+        residual = x
+        x = self.norm(x)
+
+        # Get batch size and spatial dimensions
+        batch_size, _, height, width = x.size()
+
+        # Compute query, key, and value
+        q = self.query(x)  # B x key_dim x H x W
+        k = self.key(x)    # B x key_dim x H x W
+        v = self.value(x)  # B x in_channels x H x W
+
+        # Reshape for attention computation
+        q = q.view(batch_size, self.key_dim, -1).permute(0, 2, 1)  # B x (H*W) x key_dim
+        k = k.view(batch_size, self.key_dim, -1)                   # B x key_dim x (H*W)
+        v = v.view(batch_size, -1, height * width)                 # B x in_channels x (H*W)
+
+        # Compute attention scores
+        attn = torch.bmm(q, k) / self.scale  # B x (H*W) x (H*W)
+
+        # Apply softmax to get attention weights
+        attn = F.softmax(attn, dim=-1)
+
+        # Apply attention weights to values
+        out = torch.bmm(v, attn.permute(0, 2, 1))  # B x in_channels x (H*W)
+
+        # Reshape back to spatial dimensions
+        out = out.view(batch_size, -1, height, width)
+
+        # Apply output projection
+        out = self.out_proj(out)
+
+        # Add residual connection
+        return out + residual
+
 # Deep Q-Network (DQN) Architecture
 class ResidualBlock(nn.Module):
     """
@@ -58,7 +121,7 @@ class ResidualBlock(nn.Module):
 
 class DQN(nn.Module):
     """
-    Improved Deep Q-Network for chess position evaluation.
+    Enhanced Deep Q-Network for chess position evaluation with attention mechanisms.
 
     Architecture:
     - Input: 16 channel 8x8 board representation
@@ -69,11 +132,12 @@ class DQN(nn.Module):
       * Channel 15: Player to move
 
     - Convolutional layers with residual connections extract spatial features
+    - Self-attention modules capture long-range piece interactions
     - Separate policy and value heads for better learning
     - Output: 4096 Q-values (64x64 possible from-to square combinations)
 
-    The network uses batch normalization, residual connections, and ReLU activations
-    for better training stability and performance.
+    The network uses batch normalization, residual connections, attention mechanisms,
+    and ReLU activations for better training stability and performance.
     """
     def __init__(self):
         super(DQN, self).__init__()
@@ -86,6 +150,9 @@ class DQN(nn.Module):
         self.res_block1 = ResidualBlock(64)
         self.res_block2 = ResidualBlock(64)
         self.res_block3 = ResidualBlock(64)
+
+        # Self-attention module to capture long-range piece interactions
+        self.attention = SelfAttention(64)
 
         # Additional convolutional layer to increase feature maps
         self.conv_out = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
@@ -109,6 +176,11 @@ class DQN(nn.Module):
         # Apply residual blocks
         x = self.res_block1(x)
         x = self.res_block2(x)
+
+        # Apply self-attention to capture long-range piece interactions
+        x = self.attention(x)
+
+        # Apply final residual block
         x = self.res_block3(x)
 
         # Final convolution
@@ -229,16 +301,26 @@ class ChessAgent:
     only legal moves are selected. It includes repetition detection and avoidance
     to prevent the agent from making repetitive moves that could lead to draws.
     """
-    def __init__(self, model_path=None, repetition_penalty=0.95):
+    def __init__(self, model_path=None, repetition_penalty=0.95, use_fp16=True):
         """
         Initialize the chess agent with an optional pre-trained model.
 
         Args:
             model_path (str, optional): Path to a saved model file (.pt or .pth)
             repetition_penalty (float, optional): Penalty factor for repeated positions (0-1)
+            use_fp16 (bool, optional): Whether to use FP16 precision for inference
         """
         # Initialize the policy network
         self.policy_net = DQN()
+
+        # Set up mixed precision inference
+        self.use_fp16 = use_fp16 and torch.cuda.is_available()
+        if self.use_fp16:
+            print("Using FP16 precision for model inference")
+
+        # Use CUDA if available
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.policy_net = self.policy_net.to(self.device)
 
         # Flag to track if model was loaded successfully
         self.model_loaded = False
@@ -296,11 +378,24 @@ class ChessAgent:
 
         with torch.no_grad():  # No need to track gradients for inference
             # Convert board to tensor representation
-            state_tensor = board_to_tensor(board)
-            move_mask = create_move_mask(board)
+            state_tensor = board_to_tensor(board).to(self.device)
+            move_mask = create_move_mask(board).to(self.device)
 
-            # Get Q-values for all moves from the policy network
-            q_values = self.policy_net(state_tensor, move_mask)
+            # Use FP16 precision for inference if enabled
+            if self.use_fp16:
+                # Import autocast for mixed precision inference
+                from torch.amp import autocast
+
+                # Convert tensors to FP16
+                state_tensor_fp16 = state_tensor.to(dtype=torch.float16)
+                move_mask_fp16 = move_mask.to(dtype=torch.float16)
+
+                # Use autocast for mixed precision inference
+                with autocast():
+                    q_values = self.policy_net(state_tensor_fp16, move_mask_fp16)
+            else:
+                # Standard full precision inference
+                q_values = self.policy_net(state_tensor, move_mask)
 
             # Print some stats about the Q-values to help debug
             if torch.isnan(q_values).any():

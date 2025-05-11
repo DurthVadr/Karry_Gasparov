@@ -45,10 +45,22 @@ A chess AI implementation using deep reinforcement learning techniques, with a G
 
 1. Train using PGN data and Stockfish evaluation:
    ```bash
-   python train_model_stockfish.py
+   python main.py --data_dir data --stockfish_path /path/to/stockfish
    ```
 
-2. For training on Google Colab, use the `colab_training_stockfish.ipynb` notebook
+2. Continue training with self-play:
+   ```bash
+   python main.py --self_play --stockfish_path /path/to/stockfish
+   ```
+
+3. Continue training from a saved model:
+   ```bash
+   python main.py --load_model models/model_pgn_checkpoint.pt --data_dir data
+   ```
+
+4. For training on Google Colab, use the `colab_training_stockfish.ipynb` notebook
+
+For detailed instructions on continuing training from saved models, see [MODEL_LOADING_GUIDE.md](MODEL_LOADING_GUIDE.md).
 
 ## Project Structure
 
