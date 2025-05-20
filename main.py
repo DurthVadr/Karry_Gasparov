@@ -21,7 +21,8 @@ import chess
 import argparse
 
 # Import torch.amp for mixed precision training
-from torch.amp import autocast, GradScaler
+from torch.amp import GradScaler 
+from torch.cuda.amp import autocast
 
 # Import custom modules
 from drl_agent import DQN, ChessAgent, board_to_tensor, create_move_mask
@@ -101,7 +102,7 @@ class ChessTrainer:
                 mode='min',
                 factor=self.hyperparams['optimizer']['lr_factor'],
                 patience=self.hyperparams['optimizer']['lr_patience'],
-                verbose=True,
+                #verbose=True, # Uncomment for verbose logging (it gives errors.)
                 min_lr=self.hyperparams['optimizer']['lr_min']
             )
         elif scheduler_type == 'step':
@@ -309,7 +310,7 @@ class ChessTrainer:
                     mask_fp16 = mask.to(dtype=torch.float16)
 
                     # Use autocast for mixed precision inference
-                    with autocast():
+                    with autocast('cuda'):
                         q_values = self.policy_net(state_fp16, mask_fp16)
                 else:
                     # Standard full precision inference
@@ -379,7 +380,8 @@ class ChessTrainer:
         done_batch = torch.tensor(batch.done, dtype=torch.bool).to(self.device)
         mask_batch = torch.cat(batch.mask).to(self.device)
         next_mask_batch = torch.cat(batch.next_mask).to(self.device)
-        weights = torch.tensor(weights, dtype=torch.float32).to(self.device)
+        weights = weights.detach().clone().to(self.device)
+        # weights = torch.tensor(weights, dtype=torch.float32).to(self.device) #uncomment for previous implementation
 
         # Compute Q(s_t, a) - the model computes Q(s_t), then we select the columns of actions taken
         # Use mixed precision for forward pass if available
@@ -514,6 +516,16 @@ def main():
 
     # Create trainer with optimized hyperparameters for RTX 4070
     trainer = ChessTrainer(stockfish_path=args.stockfish_path, gpu_type="rtx_4070")
+
+    print("\n🚀 GPU Diagnostic:")
+    print("CUDA Available:", torch.cuda.is_available())
+    if torch.cuda.is_available():
+        print("Device Name:", torch.cuda.get_device_name(0))
+        print("Allocated:", torch.cuda.memory_allocated() / 1024**2, "MB")
+        print("Reserved:", torch.cuda.memory_reserved() / 1024**2, "MB")
+    else:
+        print("⚠️  Warning: CUDA not available — model is using CPU.")
+
 
     # Load model if specified (to continue training from a saved model)
     if args.load_model:
