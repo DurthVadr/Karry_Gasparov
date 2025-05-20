@@ -23,7 +23,7 @@ OPTIMIZER_CONFIG = {
     'lr_min': 1e-6,                 # Minimum learning rate
     'weight_decay': 1e-4,           # L2 regularization factor
     'gradient_clip': 5.0,           # Gradient clipping threshold
-    'batch_size': 128,              # Batch size for training (increased for better GPU utilization)
+    'batch_size': 256,              # Batch size for training (increased for better GPU utilization)
 }
 
 # Experience Replay Parameters
