@@ -119,9 +119,63 @@ class ResidualBlock(nn.Module):
         x = F.relu(x)  # Apply ReLU after the addition
         return x
 
+class ChessFeatureExtractor(nn.Module):
+    """
+    Chess-specific feature extractor to encode domain knowledge.
+
+    This module extracts chess-specific features like:
+    - Piece mobility
+    - King safety
+    - Center control
+    - Pawn structure
+    """
+    def __init__(self, in_channels):
+        super(ChessFeatureExtractor, self).__init__()
+
+        # Convolutional layers for feature extraction
+        self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(32)
+
+        # Specialized feature detectors
+        # Mobility detector (3x3 kernels to detect piece movement patterns)
+        self.mobility_conv = nn.Conv2d(32, 16, kernel_size=3, padding=1)
+
+        # King safety detector (5x5 kernels to detect king surroundings)
+        self.king_safety_conv = nn.Conv2d(32, 16, kernel_size=5, padding=2)
+
+        # Center control detector (focused on e4, d4, e5, d5)
+        self.center_conv = nn.Conv2d(32, 16, kernel_size=3, padding=1)
+
+        # Pawn structure detector
+        self.pawn_structure_conv = nn.Conv2d(32, 16, kernel_size=3, padding=1)
+
+        # Final integration layer
+        self.integration_conv = nn.Conv2d(64, in_channels, kernel_size=1)
+        self.bn_out = nn.BatchNorm2d(in_channels)
+
+    def forward(self, x):
+        # Initial feature extraction
+        features = F.relu(self.bn1(self.conv1(x)))
+
+        # Extract specialized features
+        mobility = F.relu(self.mobility_conv(features))
+        king_safety = F.relu(self.king_safety_conv(features))
+        center_control = F.relu(self.center_conv(features))
+        pawn_structure = F.relu(self.pawn_structure_conv(features))
+
+        # Concatenate all specialized features
+        combined_features = torch.cat([mobility, king_safety, center_control, pawn_structure], dim=1)
+
+        # Integrate features
+        enhanced_features = F.relu(self.bn_out(self.integration_conv(combined_features)))
+
+        # Residual connection
+        return enhanced_features + x
+
 class DQN(nn.Module):
     """
-    Enhanced Deep Q-Network for chess position evaluation with attention mechanisms.
+    Enhanced Deep Q-Network for chess position evaluation with attention mechanisms
+    and chess-specific knowledge encoding.
 
     Architecture:
     - Input: 16 channel 8x8 board representation
@@ -131,31 +185,43 @@ class DQN(nn.Module):
       * Channel 14: En passant
       * Channel 15: Player to move
 
+    - Chess-specific feature extraction for domain knowledge encoding
     - Convolutional layers with residual connections extract spatial features
     - Self-attention modules capture long-range piece interactions
+    - Adaptive number of residual blocks based on network configuration
     - Separate policy and value heads for better learning
     - Output: 4096 Q-values (64x64 possible from-to square combinations)
 
     The network uses batch normalization, residual connections, attention mechanisms,
     and ReLU activations for better training stability and performance.
     """
-    def __init__(self):
+    def __init__(self, num_residual_blocks=3, channels=64, attention_layers=1):
         super(DQN, self).__init__()
 
+        # Network configuration
+        self.num_residual_blocks = num_residual_blocks
+        self.channels = channels
+        self.attention_layers = attention_layers
+
         # Initial convolutional layer
-        self.conv_in = nn.Conv2d(16, 64, kernel_size=3, stride=1, padding=1)
-        self.bn_in = nn.BatchNorm2d(64)
+        self.conv_in = nn.Conv2d(16, channels, kernel_size=3, stride=1, padding=1)
+        self.bn_in = nn.BatchNorm2d(channels)
 
-        # Residual blocks for better gradient flow
-        self.res_block1 = ResidualBlock(64)
-        self.res_block2 = ResidualBlock(64)
-        self.res_block3 = ResidualBlock(64)
+        # Chess-specific feature extractor
+        self.chess_feature_extractor = ChessFeatureExtractor(16)
 
-        # Self-attention module to capture long-range piece interactions
-        self.attention = SelfAttention(64)
+        # Create dynamic number of residual blocks
+        self.res_blocks = nn.ModuleList([
+            ResidualBlock(channels) for _ in range(num_residual_blocks)
+        ])
+
+        # Create dynamic number of attention layers
+        self.attention_modules = nn.ModuleList([
+            SelfAttention(channels) for _ in range(attention_layers)
+        ])
 
         # Additional convolutional layer to increase feature maps
-        self.conv_out = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+        self.conv_out = nn.Conv2d(channels, 128, kernel_size=3, stride=1, padding=1)
         self.bn_out = nn.BatchNorm2d(128)
 
         # Fully connected layers for Q-value prediction with reduced size
@@ -170,18 +236,19 @@ class DQN(nn.Module):
         self.mask_layer = MaskLayer()
 
     def forward(self, x, mask=None):
+        # Apply chess-specific feature extraction
+        x = self.chess_feature_extractor(x)
+
         # Initial convolution
         x = F.relu(self.bn_in(self.conv_in(x)))
 
-        # Apply residual blocks
-        x = self.res_block1(x)
-        x = self.res_block2(x)
+        # Apply residual blocks with interleaved attention
+        for i, res_block in enumerate(self.res_blocks):
+            x = res_block(x)
 
-        # Apply self-attention to capture long-range piece interactions
-        x = self.attention(x)
-
-        # Apply final residual block
-        x = self.res_block3(x)
+            # Apply attention after some residual blocks
+            if i < len(self.attention_modules):
+                x = self.attention_modules[i](x)
 
         # Final convolution
         x = F.relu(self.bn_out(self.conv_out(x)))
@@ -300,8 +367,13 @@ class ChessAgent:
     The agent also handles special cases like promotions and ensures that
     only legal moves are selected. It includes repetition detection and avoidance
     to prevent the agent from making repetitive moves that could lead to draws.
+
+    Enhanced features:
+    - Phase-aware exploration (opening, middlegame, endgame)
+    - Temperature-based move selection for controlled exploration
+    - Improved repetition handling with adaptive penalties
     """
-    def __init__(self, model_path=None, repetition_penalty=0.95, use_fp16=True):
+    def __init__(self, model_path=None, repetition_penalty=0.95, use_fp16=True, temperature=1.0):
         """
         Initialize the chess agent with an optional pre-trained model.
 
@@ -309,6 +381,8 @@ class ChessAgent:
             model_path (str, optional): Path to a saved model file (.pt or .pth)
             repetition_penalty (float, optional): Penalty factor for repeated positions (0-1)
             use_fp16 (bool, optional): Whether to use FP16 precision for inference
+            temperature (float, optional): Temperature parameter for controlling exploration
+                                          Higher values = more exploration, lower = more exploitation
         """
         # Initialize the policy network
         self.policy_net = DQN()
@@ -353,6 +427,9 @@ class ChessAgent:
         # Lower values = stronger penalty
         self.repetition_penalty = repetition_penalty
 
+        # Temperature parameter for controlling exploration
+        self.temperature = temperature
+
     def select_move(self, board):
         """
         Select the best move for the given board position using the policy network.
@@ -368,9 +445,10 @@ class ChessAgent:
         2. Creates a mask of legal moves
         3. Gets Q-values from the policy network
         4. Applies penalties for moves that lead to repeated positions
-        5. Selects the move with the highest adjusted Q-value
-        6. Handles special cases like promotions
-        7. Ensures the selected move is legal
+        5. Applies phase-aware exploration and temperature-based selection
+        6. Selects the move with the highest adjusted Q-value
+        7. Handles special cases like promotions
+        8. Ensures the selected move is legal
         """
         # Print a message to indicate if we're using a trained model or not
         if not self.model_loaded:
@@ -410,9 +488,31 @@ class ChessAgent:
             # Get the adjusted Q-values for legal moves only
             legal_adjusted_q_values = adjusted_q_values[0, legal_move_indices]
 
-            # Select the move with the highest adjusted Q-value among legal moves
-            best_legal_index_in_list = torch.argmax(legal_adjusted_q_values).item()
-            best_move_index = legal_move_indices[best_legal_index_in_list]
+            # Determine game phase for phase-aware exploration
+            game_phase = self._determine_game_phase(board)
+
+            # Apply temperature-based selection with phase-aware adjustments
+            temperature = self._get_phase_adjusted_temperature(game_phase)
+
+            # Apply temperature to Q-values (higher temperature = more exploration)
+            if temperature != 1.0:
+                # Apply softmax with temperature
+                legal_adjusted_q_values = legal_adjusted_q_values / temperature
+
+            # Decide whether to use softmax sampling or greedy selection
+            use_sampling = random.random() < self._get_phase_exploration_rate(game_phase)
+
+            if use_sampling and len(legal_move_indices) > 1:
+                # Apply softmax to get probabilities
+                probabilities = F.softmax(legal_adjusted_q_values, dim=0)
+
+                # Sample from the probability distribution
+                selected_idx = torch.multinomial(probabilities, 1).item()
+                best_move_index = legal_move_indices[selected_idx]
+            else:
+                # Greedy selection - choose the move with highest Q-value
+                best_legal_index_in_list = torch.argmax(legal_adjusted_q_values).item()
+                best_move_index = legal_move_indices[best_legal_index_in_list]
 
             # Convert index to chess move coordinates
             from_square = best_move_index // 64
@@ -442,6 +542,80 @@ class ChessAgent:
                 random_move = random.choice(list(board.legal_moves))
                 self._update_position_history(board, random_move)
                 return random_move
+
+    def _determine_game_phase(self, board):
+        """
+        Determine the current phase of the game: opening, middlegame, or endgame.
+
+        Args:
+            board (chess.Board): The current chess position
+
+        Returns:
+            str: Game phase - 'opening', 'middlegame', or 'endgame'
+        """
+        # Count the total number of pieces
+        piece_count = len(board.piece_map())
+
+        # Count the number of moves played
+        move_count = board.fullmove_number
+
+        # Check if queens are still on the board
+        has_queens = (board.pieces(chess.QUEEN, chess.WHITE) or
+                     board.pieces(chess.QUEEN, chess.BLACK))
+
+        # Opening: First 10 moves with most pieces still on board
+        if move_count <= 10 and piece_count >= 28:
+            return 'opening'
+        # Endgame: Few pieces left or no queens
+        elif piece_count <= 12 or not has_queens:
+            return 'endgame'
+        # Middlegame: Everything else
+        else:
+            return 'middlegame'
+
+    def _get_phase_adjusted_temperature(self, game_phase):
+        """
+        Get temperature parameter adjusted for the current game phase.
+
+        Args:
+            game_phase (str): Current game phase
+
+        Returns:
+            float: Adjusted temperature value
+        """
+        base_temperature = self.temperature
+
+        # Adjust temperature based on game phase
+        if game_phase == 'opening':
+            # More exploration in opening
+            return base_temperature * 1.2
+        elif game_phase == 'endgame':
+            # Less exploration in endgame
+            return base_temperature * 0.8
+        else:
+            # Standard temperature for middlegame
+            return base_temperature
+
+    def _get_phase_exploration_rate(self, game_phase):
+        """
+        Get exploration rate based on the current game phase.
+
+        Args:
+            game_phase (str): Current game phase
+
+        Returns:
+            float: Exploration rate (0-1)
+        """
+        # Base exploration rates for different phases
+        if game_phase == 'opening':
+            # Higher exploration in opening to try different openings
+            return 0.35  # Increased for more opening variety
+        elif game_phase == 'middlegame':
+            # Moderate exploration in middlegame
+            return 0.20  # Slightly increased for better tactical exploration
+        else:  # endgame
+            # Lower exploration in endgame for more precise play
+            return 0.08  # Slightly increased but still low for endgame precision
 
     def _apply_repetition_penalties(self, board, q_values):
         """

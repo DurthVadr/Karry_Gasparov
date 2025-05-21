@@ -11,7 +11,7 @@ import chess.pgn
 import chess.engine
 import numpy as np
 from drl_agent import DQN, board_to_tensor, create_move_mask
-from utils import save_model, plot_training_progress
+from utils import plot_training_progress
 
 class PGNTrainer:
     """
@@ -104,6 +104,10 @@ class PGNTrainer:
         print(f"PGN training completed! Processed {game_count} games, {total_positions} positions")
         print(f"Average speed: {positions_per_second:.1f} positions/sec")
         print(f"Total training time: {elapsed_time:.1f} seconds ({elapsed_time/3600:.2f} hours)")
+
+        # Generate and save metrics plots
+        metrics_dir = os.path.join(self.trainer.model_dir, 'metrics')
+        self.trainer.plot_metrics(output_dir=metrics_dir)
 
         return losses
 
@@ -234,6 +238,9 @@ class PGNTrainer:
                         print(f"Processed {start_count + game_count} games | {position_count} positions | "
                               f"{positions_per_second:.1f} pos/sec | Avg Loss: {avg_loss:.4f}")
 
+                        # Display simple metrics
+                        self.trainer.metrics.print_metrics()
+
                         last_report_time = current_time
 
                     # Save model periodically
@@ -250,6 +257,10 @@ class PGNTrainer:
                         # Get current learning rate
                         current_lr = self.trainer.optimizer.param_groups[0]['lr']
                         print(f"Current learning rate: {current_lr:.6f}")
+
+                        # Print current training metrics
+                        print("\n=== Current Training Metrics ===")
+                        self.trainer.print_training_metrics()
 
                         # Evaluate the checkpoint model if Stockfish is available
                         if self.trainer.stockfish_path:
@@ -282,7 +293,14 @@ class PGNTrainer:
 
 class SelfPlayTrainer:
     """
-    Advanced self-play training with curriculum learning.
+    Advanced self-play training with enhanced curriculum learning.
+
+    This trainer implements:
+    - Adaptive curriculum learning based on win rate, draw rate, and game quality
+    - Non-linear difficulty progression for more natural learning
+    - Phase-aware exploration strategies
+    - Diverse opponent pool with strategic selection
+    - Comprehensive evaluation metrics
     """
 
     def __init__(self, trainer):
@@ -294,130 +312,345 @@ class SelfPlayTrainer:
         """
         self.trainer = trainer
 
-    def train_self_play(self, num_episodes=5000, stockfish_opponent=True, stockfish_levels=None,
-                      batch_size=64, save_interval=100, eval_interval=500, target_level=7):
+        # Curriculum learning parameters
+        self.curriculum_params = {
+            'win_threshold': 0.52,       # Base win rate threshold for advancing (slightly lower for faster progression)
+            'draw_threshold': 0.30,      # Draw rate threshold for consideration (higher to value draws more)
+            'quality_threshold': 0.55,   # Game quality threshold (slightly lower for faster progression)
+            'window_size': 30,           # Number of games to calculate metrics over (smaller window for faster adaptation)
+            'difficulty_scale': [        # Non-linear difficulty scale
+                {'level': 1, 'factor': 1.0},
+                {'level': 2, 'factor': 1.2},
+                {'level': 3, 'factor': 1.5},
+                {'level': 4, 'factor': 1.8},
+                {'level': 5, 'factor': 2.2},
+                {'level': 6, 'factor': 2.7},
+                {'level': 7, 'factor': 3.3},
+                {'level': 8, 'factor': 4.0},
+                {'level': 9, 'factor': 5.0},
+                {'level': 10, 'factor': 6.0}
+            ],
+            'sublevel_steps': 3,         # Fewer sublevels for faster level progression
+            'regression_threshold': 0.25  # Lower threshold to avoid too much regression
+        }
+
+    def _calculate_effective_level(self, level, sublevel):
         """
-        Advanced self-play training with multiple opponents and adaptive difficulty.
+        Calculate the effective difficulty level based on current level and sublevel.
+
+        This creates a smoother progression between integer difficulty levels.
+
+        Args:
+            level (int): Current curriculum level
+            sublevel (int): Current sublevel within the level
+
+        Returns:
+            float: Effective difficulty level
+        """
+        # Calculate fractional level for smoother progression
+        sublevel_fraction = (sublevel - 1) / self.curriculum_params['sublevel_steps']
+        return level + sublevel_fraction
+
+    def _update_opponent_weights(self, weights, level):
+        """
+        Update opponent selection weights based on curriculum level.
+
+        Args:
+            weights (dict): Dictionary of opponent weights to update
+            level (int): Current curriculum level
+        """
+        # Adjust weights based on level
+        if level <= 2:
+            # More random opponents at early levels for exploration
+            weights['random'] = 0.3
+            weights['self'] = 0.5
+            weights['pool'] = 0.2
+        elif level <= 5:
+            # Balanced mix in middle levels
+            weights['random'] = 0.1
+            weights['self'] = 0.4
+            weights['pool'] = 0.5
+        else:
+            # More pool opponents at higher levels for challenge
+            weights['random'] = 0.05
+            weights['self'] = 0.25
+            weights['pool'] = 0.7
+
+    def _select_opponent_type(self, weights):
+        """
+        Select opponent type using weighted random selection.
+
+        Args:
+            weights (dict): Dictionary of opponent weights
+
+        Returns:
+            str: Selected opponent type ('self', 'pool', or 'random')
+        """
+        # Normalize weights
+        total = sum(weights.values())
+        normalized_weights = {k: v/total for k, v in weights.items()}
+
+        # Weighted random selection
+        r = random.random()
+        cumulative = 0
+        for opponent_type, weight in normalized_weights.items():
+            cumulative += weight
+            if r <= cumulative:
+                return opponent_type
+
+        # Default to self-play if something goes wrong
+        return 'self'
+
+    def _select_appropriate_pool_model(self, model_pool, metadata, target_level):
+        """
+        Select an appropriate model from the pool based on curriculum level.
+
+        Args:
+            model_pool (list): List of models in the pool
+            metadata (list): List of model metadata
+            target_level (float): Target difficulty level
+
+        Returns:
+            nn.Module: Selected model from the pool
+        """
+        if not model_pool:
+            raise ValueError("Model pool is empty")
+
+        # Find models close to the target level
+        suitable_models = []
+        for i, _ in enumerate(model_pool):
+            # If model has a level attribute, use it
+            model_level = metadata[i].get('level', 1)
+
+            # Calculate distance from target level
+            level_distance = abs(model_level - target_level)
+
+            # Consider models within reasonable distance
+            if level_distance <= 2:
+                suitable_models.append((i, level_distance))
+
+        # If no suitable models found, use any model
+        if not suitable_models:
+            return random.choice(model_pool)
+
+        # Sort by distance (closest first)
+        suitable_models.sort(key=lambda x: x[1])
+
+        # Select from the closest models with some randomness
+        selection_pool = suitable_models[:min(3, len(suitable_models))]
+        selected_idx = random.choice(selection_pool)[0]
+
+        return model_pool[selected_idx]
+
+    def _evaluate_move_quality(self, board, move, stockfish, depth=12):
+        """
+        Evaluate the quality of a move compared to Stockfish's best move.
+
+        Args:
+            board (chess.Board): Board position before the move
+            move (chess.Move): The move to evaluate
+            stockfish (chess.engine.SimpleEngine): Stockfish engine
+            depth (int): Evaluation depth
+
+        Returns:
+            float: Move quality score (0-1)
+        """
+        try:
+            # Get Stockfish's evaluation of the position
+            result = stockfish.analyse(board, chess.engine.Limit(depth=depth))
+            stockfish_best_move = result.get("pv")[0]
+            stockfish_score = result.get("score").relative.score(mate_score=10000)
+
+            # Make the move to evaluate
+            board_copy = board.copy()
+            board_copy.push(move)
+
+            # Get Stockfish's evaluation after the move
+            result_after = stockfish.analyse(board_copy, chess.engine.Limit(depth=depth))
+            move_score = -result_after.get("score").relative.score(mate_score=10000)
+
+            # Calculate the difference between the best move and the played move
+            if stockfish_best_move == move:
+                return 1.0  # Perfect move
+
+            # Calculate score difference
+            score_diff = abs(stockfish_score - move_score)
+
+            # Convert score difference to quality (0-1)
+            # Small differences (< 50 centipawns) are still high quality
+            if score_diff < 50:
+                quality = 1.0 - (score_diff / 100)
+            # Medium differences (50-200 centipawns) are medium quality
+            elif score_diff < 200:
+                quality = 0.75 - ((score_diff - 50) / 600)
+            # Large differences (> 200 centipawns) are low quality
+            else:
+                quality = max(0.1, 0.5 - ((score_diff - 200) / 1600))
+
+            return max(0.0, min(1.0, quality))
+        except Exception as e:
+            # If evaluation fails, return a default medium quality
+            print(f"Move quality evaluation failed: {e}")
+            return 0.5
+
+    def _get_difficulty_factor(self, level):
+        """
+        Get the difficulty scaling factor for the current level.
+
+        Args:
+            level (int): Current curriculum level
+
+        Returns:
+            float: Difficulty scaling factor
+        """
+        # Find the difficulty factor from the scale
+        for entry in self.curriculum_params['difficulty_scale']:
+            if entry['level'] == level:
+                return entry['factor']
+
+        # Default to the factor for the closest level
+        closest_level = min(self.curriculum_params['difficulty_scale'],
+                           key=lambda x: abs(x['level'] - level))
+        return closest_level['factor']
+
+    def train_self_play(self, num_episodes=5000, stockfish_levels=None,
+                      batch_size=64, save_interval=100, eval_interval=1000, target_level=7):
+        """
+        Enhanced self-play training with advanced curriculum learning.
 
         This optimized version includes:
-        1. Training against Stockfish at various levels
-        2. Self-play against previous best models
-        3. Batch processing of experiences
-        4. Adaptive difficulty based on performance
-        5. Regular evaluation against target Stockfish level
-        6. Advanced curriculum learning
+        1. Self-play against current model (model vs itself)
+        2. Self-play against previous model versions from the model pool
+        3. Batch processing of experiences for efficient training
+        4. Periodic evaluation against Stockfish for benchmarking
+        5. Comprehensive checkpointing for continuous training
+        6. Advanced curriculum learning with non-linear difficulty progression
+        7. Game quality assessment for curriculum advancement
+        8. Draw rate consideration in addition to win rate
 
         Args:
             num_episodes: Total number of episodes to train
-            stockfish_opponent: Whether to use Stockfish as an opponent
-            stockfish_levels: List of Stockfish levels to train against (default: [1,2,3,4,5,6,7])
+            stockfish_levels: List of Stockfish levels to evaluate against (default: [5,6,7])
             batch_size: Batch size for optimization
             save_interval: How often to save models (in episodes)
-            eval_interval: How often to evaluate against target level (in episodes)
+            eval_interval: How often to evaluate against Stockfish (every 1000 games)
             target_level: Target Stockfish level to achieve
 
         Returns:
             Tuple of (episode_rewards, episode_lengths, losses)
         """
-        print(f"Starting advanced self-play training for {num_episodes} episodes...")
+        print(f"Starting enhanced self-play training with advanced curriculum learning for {num_episodes} episodes...")
         print(f"Target performance: Stockfish level {target_level}")
+        print(f"Evaluation interval: Every {eval_interval} games")
+        print(f"Using non-linear difficulty progression with {self.curriculum_params['sublevel_steps']} sublevels per level")
+        print(f"Considering win rate, draw rate, and game quality for curriculum advancement")
 
-        # Set default Stockfish levels if not provided
+        # Set default Stockfish levels for evaluation if not provided
         if stockfish_levels is None:
-            stockfish_levels = list(range(1, target_level + 1))
+            stockfish_levels = [5, 6, 7]  # Focus on target levels for evaluation
 
         # Initialize tracking metrics
         self.trainer.training_stats['episode_rewards'] = []
         self.trainer.training_stats['episode_lengths'] = []
         self.trainer.training_stats['losses'] = []
         self.trainer.training_stats['win_rates'] = []
+        self.trainer.training_stats['draw_rates'] = []
+        self.trainer.training_stats['game_quality'] = []
+        self.trainer.training_stats['curriculum_level'] = []
 
         # Initialize model pool for diverse opponents
         model_pool = []
-        best_model_path = os.path.join(self.trainer.model_dir, "best_model.pt")
+        model_dir = self.trainer.model_dir
+
+        # Initialize curriculum tracking
+        self.current_level = 1
+        self.current_sublevel = 1
+        self.games_at_current_level = 0
+        self.wins_at_current_level = 0
+        self.draws_at_current_level = 0
+        self.quality_sum_at_current_level = 0
+
+        # Game outcome history for calculating metrics
+        self.game_outcomes = []  # List of 'win', 'loss', 'draw'
+        self.game_qualities = [] # List of game quality scores (0-1)
+
+        # Check if we have existing models in the model directory to add to the pool
+        existing_models = [f for f in os.listdir(model_dir) if f.endswith('.pt') and 'model_pool' in f]
+        if existing_models:
+            print(f"Found {len(existing_models)} existing models to add to the model pool")
+            for model_file in existing_models[:max_pool_size]:  # Limit to max pool size
+                try:
+                    model_path = os.path.join(model_dir, model_file)
+                    model_copy = DQN()
+                    model_copy.load_state_dict(torch.load(model_path, map_location=self.trainer.device))
+                    model_pool.append(model_copy)
+
+                    # Extract episode number from filename
+                    episode_num = int(model_file.split('_')[-1].split('.')[0])
+                    model_pool_metadata.append({
+                        'episode': episode_num,
+                        'path': model_path,
+                        'level': 1  # Default level
+                    })
+                    print(f"Added {model_file} to model pool")
+                except Exception as e:
+                    print(f"Error loading model {model_file}: {e}")
+
+            print(f"Successfully loaded {len(model_pool)} models into the pool")
+
+        best_model_path = os.path.join(model_dir, "best_model.pt")
 
         # Track training progress
         start_time = time.time()
         total_positions = 0
         total_optimization_steps = 0
 
-        # Enhanced adaptive curriculum learning parameters
-        current_level = 1  # Start with easiest level
-        current_sublevel = 0  # Sublevel for more granular progression (0-9)
-
-        # Dynamic win rate thresholds based on level
-        # Higher levels require higher win rates to advance
-        base_win_rate_threshold = 0.55  # Base threshold for advancing
-        win_rate_window = 30  # Calculate win rate over this many games (reduced for faster adaptation)
-
-        # Track performance against each level and sublevel
-        level_performance = {}  # Store performance metrics for each level
-        wins_against_current_level = 0
-        games_against_current_level = 0
-
         # Enhanced model pool parameters
-        max_pool_size = 10  # Increased from 5 for more diversity
+        max_pool_size = 10  # Size of model pool for diverse opponents
         model_pool_metadata = []  # Track metadata about each model in the pool
 
-        # Create a separate Stockfish instance for opponents if needed
-        opponent_stockfish = None
-        if stockfish_opponent:
+        # Opponent selection weights - will be adjusted based on curriculum level
+        self.opponent_weights = {
+            'self': 0.3,      # Play against itself
+            'pool': 0.5,      # Play against model pool
+            'random': 0.2     # Play against random moves (for exploration)
+        }
+
+        # Create a separate Stockfish instance for evaluation only
+        evaluation_stockfish = None
+        if self.trainer.stockfish_path:
             try:
-                # Use the stored Stockfish path
-                opponent_stockfish = chess.engine.SimpleEngine.popen_uci(self.trainer.stockfish_path)
-                # Configure Stockfish with base level and adjust time based on sublevel
-                opponent_stockfish.configure({"Skill Level": current_level})
-
-                # Adjust thinking time based on sublevel (0-9)
-                # Lower sublevels get less thinking time, making them easier
-                base_time = 0.05  # Base thinking time in seconds
-                time_factor = 0.01 * current_sublevel  # 0.01s increments per sublevel
-                thinking_time = base_time + time_factor
-
-                print(f"Initialized opponent Stockfish at level {current_level}.{current_sublevel} using path: {self.trainer.stockfish_path}")
+                # Initialize Stockfish for evaluation only
+                evaluation_stockfish = chess.engine.SimpleEngine.popen_uci(self.trainer.stockfish_path)
+                print(f"Initialized Stockfish for evaluation using path: {self.trainer.stockfish_path}")
             except Exception as e:
-                print(f"Error initializing opponent Stockfish: {e}")
-                stockfish_opponent = False
+                print(f"Error initializing Stockfish for evaluation: {e}")
+                print("Stockfish evaluation will not be available")
 
         # Main training loop
         for episode in range(num_episodes):
-            # Determine opponent type for this episode
-            use_stockfish = False
+            # Calculate effective difficulty level based on current level and sublevel
+            effective_level = self._calculate_effective_level(self.current_level, self.current_sublevel)
+
+            # Update opponent selection weights based on curriculum level
+            self._update_opponent_weights(self.opponent_weights, self.current_level)
+
+            # Select opponent type using weighted random selection
+            opponent_type = self._select_opponent_type(self.opponent_weights)
+
+            # Initialize opponent model based on selected type
+            opponent_model = None
             use_model_pool = False
+            use_random_moves = False
 
-            if stockfish_opponent:
-                # 70% chance to play against Stockfish when available
-                if random.random() < 0.7:
-                    use_stockfish = True
-
-                    # Occasionally play against higher levels for challenge (10% chance)
-                    if random.random() < 0.1 and current_level < max(stockfish_levels):
-                        # Challenge with higher level or higher sublevel
-                        if current_level < max(stockfish_levels) - 1:
-                            challenge_level = current_level + 1
-                            challenge_sublevel = random.randint(0, 9)
-                        else:
-                            challenge_level = current_level
-                            challenge_sublevel = min(current_sublevel + 5, 9)
-
-                        # Configure challenge level
-                        opponent_stockfish.configure({"Skill Level": challenge_level})
-
-                        # Set challenge thinking time as a global variable for use in play method
-                        global challenge_time
-                        challenge_time = base_time + (0.01 * challenge_sublevel)
-
-                        print(f"Challenge game against Stockfish level {challenge_level}.{challenge_sublevel}")
-                    else:
-                        # Regular game at current level and sublevel
-                        opponent_stockfish.configure({"Skill Level": current_level})
-
-            # Use model pool if available and not using Stockfish
-            if not use_stockfish and len(model_pool) > 0 and random.random() < 0.8:
-                use_model_pool = True
-                # Select a random model from the pool
-                opponent_model = random.choice(model_pool)
+            if opponent_type == 'pool' and len(model_pool) > 0:
+                # Select a model from the pool based on curriculum level
+                opponent_model = self._select_appropriate_pool_model(model_pool, model_pool_metadata, effective_level)
                 opponent_model.eval()  # Set to evaluation mode
+                use_model_pool = True
+            elif opponent_type == 'random':
+                use_random_moves = True
+            # else: use self-play (opponent_type == 'self')
 
             # Initialize the game
             board = chess.Board()
@@ -425,6 +658,7 @@ class SelfPlayTrainer:
             episode_length = 0
             positions_seen = {}  # Track positions for repetition detection
             experiences = []  # Collect experiences for batch processing
+            move_qualities = []  # Track quality of moves for game quality assessment
 
             # Play the game
             done = False
@@ -434,24 +668,16 @@ class SelfPlayTrainer:
                 mask = create_move_mask(board, self.trainer.device)
 
                 if board.turn == chess.WHITE:  # Our model plays as White
-                    # Select action using our policy
+                    # Select action using our policy with phase-aware exploration
                     action_idx, move = self.trainer.select_action(state, mask, board)
-                else:  # Opponent plays as Black
-                    if use_stockfish:
-                        # Get move from Stockfish with adaptive thinking time
-                        # Use challenge_time if available (for challenge games), otherwise use regular thinking time
-                        if 'challenge_time' in globals():
-                            thinking_time = challenge_time
-                            # Reset after use to avoid affecting future regular games
-                            del globals()['challenge_time']
-                        else:
-                            thinking_time = base_time + time_factor
 
-                        result = opponent_stockfish.play(board, chess.engine.Limit(time=thinking_time))
-                        move = result.move
-                        action_idx = move.from_square * 64 + move.to_square
-                    elif use_model_pool:
-                        # Get move from opponent model
+                    # Evaluate move quality if Stockfish is available (for White only)
+                    if evaluation_stockfish:
+                        move_quality = self._evaluate_move_quality(board, move, evaluation_stockfish)
+                        move_qualities.append(move_quality)
+                else:  # Opponent plays as Black
+                    if use_model_pool:
+                        # Get move from opponent model in the pool
                         with torch.no_grad():
                             q_values = opponent_model(state, mask)
                             legal_moves = list(board.legal_moves)
@@ -460,8 +686,13 @@ class SelfPlayTrainer:
                             best_idx = torch.argmax(legal_q_values).item()
                             move = legal_moves[best_idx]
                             action_idx = legal_move_indices[best_idx]
+                    elif use_random_moves:
+                        # Choose a random legal move
+                        legal_moves = list(board.legal_moves)
+                        move = random.choice(legal_moves)
+                        action_idx = move.from_square * 64 + move.to_square
                     else:
-                        # Self-play against current policy
+                        # Self-play against current policy (model plays against itself)
                         action_idx, move = self.trainer.select_action(state, mask, board)
 
                 # Store current board for reward calculation
@@ -477,12 +708,13 @@ class SelfPlayTrainer:
                 # Check if game is over
                 done = board.is_game_over()
 
-                # Calculate reward using adaptive sampling
-                # The reward calculator will determine position importance internally
-                # and adjust evaluation depth accordingly
-                reward = self.trainer.reward_calculator.calculate_stockfish_reward(board, prev_board)
+                # Calculate reward using adaptive sampling with difficulty adjustment
+                base_reward = self.trainer.reward_calculator.calculate_stockfish_reward(board, prev_board)
 
-                # Handle repetitions
+                # Scale reward based on curriculum level for better learning progression
+                reward = base_reward * self._get_difficulty_factor(self.current_level)
+
+                # Handle repetitions with enhanced penalties
                 board_fen = board.fen().split(' ')[0]
                 if board_fen in positions_seen:
                     positions_seen[board_fen] += 1
@@ -528,115 +760,176 @@ class SelfPlayTrainer:
             # Track metrics
             self.trainer.training_stats['episode_rewards'].append(episode_reward)
             self.trainer.training_stats['episode_lengths'].append(episode_length)
+            self.trainer.training_stats['curriculum_level'].append(effective_level)
 
-            # Update win statistics for curriculum learning
-            if use_stockfish:
-                games_against_current_level += 1
-                if board.is_checkmate() and board.turn == chess.BLACK:  # Model (White) won
-                    wins_against_current_level += 1
+            # Calculate game quality (average move quality)
+            game_quality = sum(move_qualities) / max(len(move_qualities), 1) if move_qualities else 0.5
+            self.game_qualities.append(game_quality)
 
-                # Calculate win rate over the window
-                if games_against_current_level >= win_rate_window:
-                    win_rate = wins_against_current_level / games_against_current_level
-                    self.trainer.training_stats['win_rates'].append(win_rate)
+            # Track game outcome for statistics and curriculum advancement
+            game_outcome = None
+            if board.is_checkmate():
+                if board.turn == chess.BLACK:  # Model (White) won
+                    game_outcome = "win"
+                else:  # Model (Black) lost
+                    game_outcome = "loss"
+            elif board.is_stalemate() or board.is_insufficient_material():
+                game_outcome = "draw"
+            else:
+                game_outcome = "incomplete"
 
-                    # Calculate dynamic win rate threshold based on level
-                    # Higher levels require higher win rates to advance
-                    win_rate_threshold = base_win_rate_threshold + (current_level * 0.02)
+            # Update game outcomes history
+            self.game_outcomes.append(game_outcome)
 
-                    # Store performance metrics for this level
-                    level_key = f"{current_level}.{current_sublevel}"
-                    if level_key not in level_performance:
-                        level_performance[level_key] = []
-                    level_performance[level_key].append(win_rate)
+            # Update curriculum tracking
+            self.games_at_current_level += 1
+            if game_outcome == "win":
+                self.wins_at_current_level += 1
+            elif game_outcome == "draw":
+                self.draws_at_current_level += 1
+            self.quality_sum_at_current_level += game_quality
 
-                    # Advance to next sublevel or level if win rate is high enough
-                    if win_rate >= win_rate_threshold:
-                        # Save model before advancing
-                        sublevel_model_path = os.path.join(
-                            self.trainer.model_dir,
-                            f"model_level_{current_level}_{current_sublevel}.pt"
-                        )
-                        torch.save(self.trainer.policy_net.state_dict(), sublevel_model_path)
+            # Check if we should update curriculum level
+            if self.games_at_current_level >= self.curriculum_params['window_size']:
+                # Calculate metrics
+                win_rate = self.wins_at_current_level / self.games_at_current_level
+                draw_rate = self.draws_at_current_level / self.games_at_current_level
+                avg_quality = self.quality_sum_at_current_level / self.games_at_current_level
 
-                        # Add current model to the pool with metadata
-                        model_copy = DQN()
-                        model_copy.load_state_dict(self.trainer.policy_net.state_dict())
+                # Store metrics
+                self.trainer.training_stats['win_rates'].append(win_rate)
+                self.trainer.training_stats['draw_rates'].append(draw_rate)
+                self.trainer.training_stats['game_quality'].append(avg_quality)
 
-                        # Create metadata for this model
-                        model_metadata = {
-                            'level': current_level,
-                            'sublevel': current_sublevel,
-                            'win_rate': win_rate,
-                            'episode': episode,
-                            'path': sublevel_model_path
-                        }
-
-                        # Add to pool or replace least successful model if pool is full
-                        if len(model_pool) < max_pool_size:
-                            model_pool.append(model_copy)
-                            model_pool_metadata.append(model_metadata)
-                            print(f"Added model to pool (size: {len(model_pool)})")
-                        else:
-                            # Find the least successful model to replace
-                            # Use a combination of level and win rate to determine
-                            replacement_scores = [
-                                (i, meta['level'] + meta['win_rate'])
-                                for i, meta in enumerate(model_pool_metadata)
-                            ]
-                            replacement_scores.sort(key=lambda x: x[1])  # Sort by score
-                            idx = replacement_scores[0][0]  # Get index of lowest scoring model
-
-                            # Replace the model
-                            model_pool[idx] = model_copy
-                            model_pool_metadata[idx] = model_metadata
-                            print(f"Replaced model in pool at position {idx}")
-
-                        # Advance sublevel or level
-                        if current_sublevel < 9:
-                            # Advance sublevel
-                            current_sublevel += 1
-                            print(f"\n=== ADVANCING TO SUBLEVEL {current_level}.{current_sublevel} ===")
-                            print(f"Win rate at level {current_level}.{current_sublevel-1}: {win_rate*100:.1f}%")
-                        elif current_level < max(stockfish_levels):
-                            # Advance to next level
-                            current_level += 1
-                            current_sublevel = 0
-                            print(f"\n=== ADVANCING TO STOCKFISH LEVEL {current_level}.{current_sublevel} ===")
-                            print(f"Win rate at level {current_level-1}.9: {win_rate*100:.1f}%")
-
-                        # Reset statistics for new level/sublevel
-                        wins_against_current_level = 0
-                        games_against_current_level = 0
-
-            # Evaluate against target level periodically
-            if stockfish_opponent and (episode + 1) % eval_interval == 0:
-                print(f"\n=== Evaluating against Stockfish level {target_level} ===")
-                # Save current model for evaluation
-                eval_model_path = os.path.join(self.trainer.model_dir, "temp_eval_model.pt")
-                torch.save(self.trainer.policy_net.state_dict(), eval_model_path)
-
-                # Run evaluation
-                results = self.trainer.evaluate_against_stockfish(
-                    model_path=eval_model_path,
-                    num_games=5,
-                    stockfish_levels=[target_level]
+                # Determine if we should advance, maintain, or regress the curriculum
+                should_advance = (
+                    win_rate >= self.curriculum_params['win_threshold'] and
+                    avg_quality >= self.curriculum_params['quality_threshold']
                 )
 
-                # Check if we've reached target level
-                if results and target_level in results:
-                    score = results[target_level]['score']
-                    if score >= 0.5:  # 50% or better score against target
+                # Consider draws as partial success for advancement
+                if not should_advance and draw_rate > self.curriculum_params['draw_threshold']:
+                    # If many draws but good quality, still consider advancing
+                    combined_success_rate = win_rate + (draw_rate * 0.5)
+                    should_advance = (
+                        combined_success_rate >= self.curriculum_params['win_threshold'] and
+                        avg_quality >= self.curriculum_params['quality_threshold']
+                    )
+
+                # Check if we should regress due to poor performance
+                should_regress = win_rate < self.curriculum_params['regression_threshold']
+
+                if should_advance:
+                    # Advance to next sublevel
+                    self.current_sublevel += 1
+                    if self.current_sublevel > self.curriculum_params['sublevel_steps']:
+                        # Advance to next level
+                        self.current_sublevel = 1
+                        self.current_level += 1
+                        print(f"Curriculum advanced to level {self.current_level}.{self.current_sublevel} "
+                              f"(win rate: {win_rate:.2f}, draw rate: {draw_rate:.2f}, quality: {avg_quality:.2f})")
+                    else:
+                        print(f"Curriculum advanced to sublevel {self.current_level}.{self.current_sublevel} "
+                              f"(win rate: {win_rate:.2f}, draw rate: {draw_rate:.2f}, quality: {avg_quality:.2f})")
+                elif should_regress:
+                    # Regress to previous sublevel
+                    self.current_sublevel -= 1
+                    if self.current_sublevel < 1:
+                        # Regress to previous level
+                        self.current_level = max(1, self.current_level - 1)
+                        self.current_sublevel = self.curriculum_params['sublevel_steps']
+                        print(f"Curriculum regressed to level {self.current_level}.{self.current_sublevel} "
+                              f"due to poor performance (win rate: {win_rate:.2f})")
+                    else:
+                        print(f"Curriculum regressed to sublevel {self.current_level}.{self.current_sublevel} "
+                              f"(win rate: {win_rate:.2f})")
+
+                # Reset tracking for next window
+                self.games_at_current_level = 0
+                self.wins_at_current_level = 0
+                self.draws_at_current_level = 0
+                self.quality_sum_at_current_level = 0
+
+            # Log game outcome for statistics
+            if game_outcome in ["win", "loss", "draw"]:
+                if 'outcomes' not in self.trainer.training_stats:
+                    self.trainer.training_stats['outcomes'] = {'win': 0, 'loss': 0, 'draw': 0}
+                self.trainer.training_stats['outcomes'][game_outcome] += 1
+
+            # Add current model to the pool periodically
+            if (episode + 1) % 100 == 0:
+                # Save model for the pool
+                pool_model_path = os.path.join(
+                    self.trainer.model_dir,
+                    f"model_pool_episode_{episode+1}.pt"
+                )
+                torch.save(self.trainer.policy_net.state_dict(), pool_model_path)
+
+                # Create a copy for the model pool
+                model_copy = DQN()
+                model_copy.load_state_dict(self.trainer.policy_net.state_dict())
+
+                # Create metadata for this model
+                model_metadata = {
+                    'episode': episode,
+                    'reward': episode_reward,
+                    'path': pool_model_path
+                }
+
+                # Add to pool or replace oldest model if pool is full
+                if len(model_pool) < max_pool_size:
+                    model_pool.append(model_copy)
+                    model_pool_metadata.append(model_metadata)
+                    print(f"Added model to pool (size: {len(model_pool)})")
+                else:
+                    # Find the oldest model to replace
+                    oldest_idx = min(range(len(model_pool_metadata)),
+                                    key=lambda i: model_pool_metadata[i]['episode'])
+
+                    # Replace the model
+                    model_pool[oldest_idx] = model_copy
+                    model_pool_metadata[oldest_idx] = model_metadata
+                    print(f"Replaced oldest model in pool (from episode {model_pool_metadata[oldest_idx]['episode']})")
+
+                print(f"Model pool now contains {len(model_pool)} models from different training stages")
+
+            # Evaluate against Stockfish levels periodically (every 1000 games)
+            if (episode + 1) % eval_interval == 0 and self.trainer.stockfish_path and evaluation_stockfish:
+                print(f"\n=== Evaluating model at episode {episode+1} against Stockfish levels {stockfish_levels} ===")
+
+                # Save current model for evaluation
+                eval_model_path = os.path.join(self.trainer.model_dir, f"model_checkpoint_episode_{episode+1}.pt")
+                torch.save(self.trainer.policy_net.state_dict(), eval_model_path)
+                print(f"Checkpoint saved to {eval_model_path}")
+
+                # Run evaluation against all target levels
+                results = self.trainer.evaluate_against_stockfish(
+                    model_path=eval_model_path,
+                    num_games=5,  # 5 games per level for faster evaluation
+                    stockfish_levels=stockfish_levels
+                )
+
+                # Check performance against target levels
+                if results:
+                    print("\n=== Evaluation Results ===")
+                    for level in sorted(results.keys()):
+                        score = results[level]['score'] * 100
+                        wins = results[level]['wins']
+                        losses = results[level]['losses']
+                        draws = results[level]['draws']
+                        print(f"Stockfish Level {level}: Score {score:.1f}% | +{wins} -{losses} ={draws}")
+
+                    # Check if we've reached target level
+                    if target_level in results and results[target_level]['score'] >= 0.5:
                         print(f"\n!!! TARGET ACHIEVED: Model performs at Stockfish level {target_level} !!!")
-                        print(f"Score: {score*100:.1f}%")
 
                         # Save this model as a milestone
-                        milestone_path = os.path.join(self.trainer.model_dir, f"model_level_{target_level}.pt")
+                        milestone_path = os.path.join(self.trainer.model_dir, f"model_milestone_level_{target_level}.pt")
                         torch.save(self.trainer.policy_net.state_dict(), milestone_path)
                         print(f"Milestone model saved to {milestone_path}")
 
-                        # Optionally increase target level
-                        if target_level < 10:
+                        # Optionally increase target level for next milestone
+                        if target_level < max(stockfish_levels):
                             target_level += 1
                             print(f"New target level: {target_level}")
 
@@ -650,24 +943,49 @@ class SelfPlayTrainer:
                 avg_length = sum(self.trainer.training_stats['episode_lengths'][-10:]) / 10
                 avg_loss = sum(self.trainer.training_stats['losses'][-100:]) / max(len(self.trainer.training_stats['losses'][-100:]), 1) if self.trainer.training_stats['losses'] else 0
 
-                print(f"Episode {episode+1}/{num_episodes} | Level: {current_level}/{max(stockfish_levels)} | "
+                print(f"Episode {episode+1}/{num_episodes} | "
                       f"Avg Reward: {avg_reward:.2f} | Avg Length: {avg_length:.1f} | Loss: {avg_loss:.4f} | "
                       f"Positions: {total_positions} ({positions_per_second:.1f}/s) | "
                       f"Time: {elapsed_time/3600:.2f}h")
 
+                # Update simple metrics
+                self.trainer.metrics.update_reward(avg_reward)
+
+                # Display metrics every 10 episodes
+                if (episode + 1) % 10 == 0:
+                    self.trainer.metrics.print_metrics()
+
             # Save model periodically
             if (episode + 1) % save_interval == 0:
+                # Save regular checkpoint
                 checkpoint_path = f"model_self_play_episode_{episode+1}.pt"
                 self.trainer.save_model(checkpoint_path)
+                print(f"Model checkpoint saved to {os.path.join(self.trainer.model_dir, checkpoint_path)}")
+
+                # Save comprehensive checkpoint with optimizer state for resuming training
+                comprehensive_checkpoint = {
+                    'model_state_dict': self.trainer.policy_net.state_dict(),
+                    'optimizer_state_dict': self.trainer.optimizer.state_dict(),
+                    'target_net_state_dict': self.trainer.target_net.state_dict(),
+                    'training_stats': self.trainer.training_stats,
+                    'episode': episode,
+                    'total_positions': total_positions
+                }
+                comprehensive_path = os.path.join(self.trainer.model_dir, f"checkpoint_complete_{episode+1}.pt")
+                torch.save(comprehensive_checkpoint, comprehensive_path)
+                print(f"Comprehensive checkpoint saved to {comprehensive_path}")
 
                 # Update best model if this is the best so far
                 if episode_reward > max(self.trainer.training_stats['episode_rewards'][:-1], default=float('-inf')):
                     torch.save(self.trainer.policy_net.state_dict(), best_model_path)
                     print(f"New best model saved with reward: {episode_reward:.2f}")
 
-                # Plot training progress
-                plot_training_progress(self.trainer.training_stats,
-                                      os.path.join(self.trainer.model_dir, 'training_progress.png'))
+                # Plot training metrics
+                self.trainer.plot_metrics(output_dir=os.path.join(self.trainer.model_dir, 'metrics'))
+
+                # Print current training metrics
+                print("\n=== Current Training Metrics ===")
+                self.trainer.print_training_metrics()
 
                 # Calculate average loss for scheduler
                 avg_loss = sum(self.trainer.training_stats['losses'][-100:]) / max(len(self.trainer.training_stats['losses'][-100:]), 1) if self.trainer.training_stats['losses'] else 0
@@ -679,14 +997,24 @@ class SelfPlayTrainer:
                 current_lr = self.trainer.optimizer.param_groups[0]['lr']
                 print(f"Current learning rate: {current_lr:.6f}")
 
+                # Print detailed statistics
+                if 'outcomes' in self.trainer.training_stats:
+                    outcomes = self.trainer.training_stats['outcomes']
+                    total_games = sum(outcomes.values())
+                    if total_games > 0:
+                        win_rate = outcomes['win'] / total_games * 100
+                        draw_rate = outcomes['draw'] / total_games * 100
+                        loss_rate = outcomes['loss'] / total_games * 100
+                        print(f"Game outcomes: Win: {win_rate:.1f}% | Draw: {draw_rate:.1f}% | Loss: {loss_rate:.1f}%")
+
                 # Evaluate the checkpoint model if Stockfish is available
                 if self.trainer.stockfish_path:
                     print(f"\n=== Evaluating checkpoint model: {checkpoint_path} ===")
-                    # Use a smaller number of games for faster evaluation during training
+                    # Evaluate against target Stockfish levels
                     results = self.trainer.model_evaluator.evaluate_against_stockfish(
                         model_path=os.path.join(self.trainer.model_dir, checkpoint_path),
-                        num_games=3,  # Fewer games for quicker evaluation
-                        stockfish_levels=[1, 3, 5, target_level]  # Test against key levels including target
+                        num_games=5,  # 5 games per level for more reliable evaluation
+                        stockfish_levels=stockfish_levels  # Focus on target levels
                     )
 
                     # Print brief summary
@@ -708,11 +1036,15 @@ class SelfPlayTrainer:
         self.trainer.save_model("model_self_play_final.pt")
 
         # Clean up
-        if opponent_stockfish:
-            opponent_stockfish.quit()
+        if evaluation_stockfish:
+            evaluation_stockfish.quit()
 
-        print(f"Advanced self-play training completed! Total positions: {total_positions}")
+        print(f"Self-play training completed! Total positions: {total_positions}")
         print(f"Total training time: {(time.time() - start_time)/3600:.2f} hours")
+
+        # Generate and save metrics plots
+        metrics_dir = os.path.join(self.trainer.model_dir, 'metrics')
+        self.trainer.plot_metrics(output_dir=metrics_dir)
 
         return (self.trainer.training_stats['episode_rewards'],
                 self.trainer.training_stats['episode_lengths'],

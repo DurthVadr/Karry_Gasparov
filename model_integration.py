@@ -19,12 +19,9 @@ Usage:
 import chess
 import random
 import os
-import sys
-import torch
-import numpy as np
 
-# Import the DQN and helper functions from drl_agent.py
-from drl_agent import DQN, board_to_tensor, create_move_mask, ChessAgent
+# Import the ChessAgent from drl_agent.py
+from drl_agent import ChessAgent
 
 class RandomModel:
     """A simple model that makes random moves"""

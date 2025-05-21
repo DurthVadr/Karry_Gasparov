@@ -13,7 +13,6 @@ Features:
 """
 
 import os
-import time
 import random
 import numpy as np
 import torch
@@ -21,17 +20,19 @@ import chess
 import argparse
 
 # Import torch.amp for mixed precision training
-from torch.amp import GradScaler 
+from torch.amp import GradScaler
 from torch.cuda.amp import autocast
 
 # Import custom modules
-from drl_agent import DQN, ChessAgent, board_to_tensor, create_move_mask
+from drl_agent import DQN
 from memory import PrioritizedReplayMemory, Experience
 from reward import RewardCalculator
 from evaluation import ModelEvaluator
-from visualization import plot_training_progress, plot_evaluation_results
+from visualization import plot_evaluation_results
 from training import PGNTrainer, SelfPlayTrainer
 from hyperparameters import get_optimized_hyperparameters
+from simple_metrics import SimpleMetrics
+from metrics_visualization import plot_training_metrics, plot_performance_summary, plot_training_progress
 
 class ChessTrainer:
     """
@@ -141,6 +142,9 @@ class ChessTrainer:
             use_fp16=self.fp16_enabled
         )
 
+        # Initialize simple metrics for on-the-fly monitoring
+        self.metrics = SimpleMetrics(window_size=100)
+
         # Initialize trainers
         self.pgn_trainer = PGNTrainer(self)
         self.self_play_trainer = SelfPlayTrainer(self)
@@ -182,25 +186,24 @@ class ChessTrainer:
         """
         return self.pgn_trainer.train_from_pgn(pgn_path, num_games, batch_size, save_interval)
 
-    def train_self_play(self, num_episodes=5000, stockfish_opponent=True, stockfish_levels=None,
-                      batch_size=64, save_interval=100, eval_interval=500, target_level=7):
+    def train_self_play(self, num_episodes=5000, stockfish_levels=None,
+                      batch_size=64, save_interval=100, eval_interval=1000, target_level=7):
         """
-        Train the model using self-play.
+        Train the model using pure self-play (model vs itself and model pool).
 
         Args:
             num_episodes (int): Total number of episodes to train
-            stockfish_opponent (bool): Whether to use Stockfish as an opponent
-            stockfish_levels (list): List of Stockfish levels to train against
+            stockfish_levels (list): List of Stockfish levels to evaluate against
             batch_size (int): Batch size for optimization
             save_interval (int): How often to save models (in episodes)
-            eval_interval (int): How often to evaluate against target level (in episodes)
+            eval_interval (int): How often to evaluate against Stockfish (in episodes)
             target_level (int): Target Stockfish level to achieve
 
         Returns:
             tuple: (episode_rewards, episode_lengths, losses)
         """
         return self.self_play_trainer.train_self_play(
-            num_episodes, stockfish_opponent, stockfish_levels,
+            num_episodes, stockfish_levels,
             batch_size, save_interval, eval_interval, target_level
         )
 
@@ -235,13 +238,16 @@ class ChessTrainer:
         """
         Load a model from disk to continue training from a saved checkpoint.
 
-        This method loads a previously saved model state and configures both the policy
-        and target networks to continue training from where it left off. It handles
-        device compatibility (CPU/GPU) automatically.
+        This method supports two types of checkpoints:
+        1. Simple model state dict (.pt files)
+        2. Comprehensive checkpoints with optimizer state and training stats
 
         Usage examples:
             # Load from models directory
             trainer.load_model("model_pgn_checkpoint.pt")
+
+            # Load comprehensive checkpoint
+            trainer.load_model("checkpoint_complete_1000.pt")
 
             # Load from absolute path
             trainer.load_model("/path/to/model_self_play_episode_1000.pt")
@@ -263,18 +269,51 @@ class ChessTrainer:
         if os.path.exists(filepath):
             try:
                 # Load state dict with appropriate device mapping
-                state_dict = torch.load(filepath, map_location=self.device)
-                self.policy_net.load_state_dict(state_dict)
-                self.target_net.load_state_dict(self.policy_net.state_dict())
+                checkpoint = torch.load(filepath, map_location=self.device)
+
+                # Check if this is a comprehensive checkpoint or just a model state dict
+                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                    print(f"Loading comprehensive checkpoint from {filepath}")
+
+                    # Load model state
+                    self.policy_net.load_state_dict(checkpoint['model_state_dict'])
+
+                    # Load target network if available
+                    if 'target_net_state_dict' in checkpoint:
+                        self.target_net.load_state_dict(checkpoint['target_net_state_dict'])
+                    else:
+                        self.target_net.load_state_dict(self.policy_net.state_dict())
+
+                    # Load optimizer state if available
+                    if 'optimizer_state_dict' in checkpoint:
+                        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                        print("Optimizer state restored")
+
+                    # Load training stats if available
+                    if 'training_stats' in checkpoint:
+                        self.training_stats = checkpoint['training_stats']
+                        print("Training statistics restored")
+
+                    # Load episode count if available
+                    if 'episode' in checkpoint:
+                        self.steps_done = checkpoint.get('total_positions', 0)
+                        print(f"Resuming from episode {checkpoint['episode']+1} with {self.steps_done} steps done")
+                else:
+                    # Simple model state dict
+                    self.policy_net.load_state_dict(checkpoint)
+                    self.target_net.load_state_dict(self.policy_net.state_dict())
+                    print(f"Model state loaded from {filepath}")
 
                 # Make sure models are on the correct device
                 self.policy_net.to(self.device)
                 self.target_net.to(self.device)
 
-                print(f"Model loaded from {filepath} to {self.device}")
+                print(f"Model loaded successfully to {self.device}")
                 return True
             except Exception as e:
                 print(f"Error loading model from {filepath}: {e}")
+                import traceback
+                traceback.print_exc()
                 return False
         else:
             print(f"Model file {filepath} not found")
@@ -297,6 +336,9 @@ class ChessTrainer:
                         np.exp(-1. * self.steps_done / self.eps_decay)
         self.steps_done += 1
 
+        # Update exploration rate metric
+        self.metrics.update_exploration(eps_threshold)
+
         # Move tensors to the correct device
         state = state.to(self.device)
         mask = mask.to(self.device)
@@ -317,10 +359,14 @@ class ChessTrainer:
                     q_values = self.policy_net(state, mask)
 
                 # Track average Q-values for monitoring
+                max_q_value = q_values.max().item()
                 if len(self.training_stats['avg_q_values']) < 1000:
-                    self.training_stats['avg_q_values'].append(q_values.max().item())
+                    self.training_stats['avg_q_values'].append(max_q_value)
                 else:
-                    self.training_stats['avg_q_values'] = self.training_stats['avg_q_values'][1:] + [q_values.max().item()]
+                    self.training_stats['avg_q_values'] = self.training_stats['avg_q_values'][1:] + [max_q_value]
+
+                # Track position seen
+                self.metrics.increment_positions()
 
                 # Get the action with highest Q-value
                 action_idx = q_values.max(1)[1].item()
@@ -394,7 +440,7 @@ class ChessTrainer:
                 next_state_batch_fp16 = next_state_batch.to(dtype=torch.float16)
                 next_mask_batch_fp16 = next_mask_batch.to(dtype=torch.float16)
 
-                with autocast():
+                with autocast('cuda'):
                     # Forward pass with FP16 tensors
                     state_action_values = self.policy_net(state_batch_fp16, mask_batch_fp16).gather(1, action_batch)
 
@@ -406,7 +452,7 @@ class ChessTrainer:
                         next_state_values[done_batch] = 0.0
             else:
                 # Use autocast without explicit conversion
-                with autocast():
+                with autocast('cuda'):
                     state_action_values = self.policy_net(state_batch, mask_batch).gather(1, action_batch)
 
                     # Compute V(s_{t+1}) for all next states
@@ -463,12 +509,49 @@ class ChessTrainer:
 
             self.optimizer.step()
 
-        return loss.item()
+        # Update simple metrics
+        loss_value = loss.item()
+        self.metrics.update_loss(loss_value)
+
+        # Update Q-value metrics if available
+        if hasattr(self, 'training_stats') and 'avg_q_values' in self.training_stats and self.training_stats['avg_q_values']:
+            self.metrics.update_q_value(self.training_stats['avg_q_values'][-1])
+
+        return loss_value
 
     def close(self):
         """Close all resources."""
         self.reward_calculator.close()
         self.model_evaluator.close()
+
+    def print_training_metrics(self):
+        """
+        Print current training metrics to the console.
+        """
+        self.metrics.print_metrics()
+
+    def plot_metrics(self, output_dir="metrics"):
+        """
+        Generate and save plots of the training metrics.
+
+        Args:
+            output_dir (str): Directory to save the plots
+        """
+        # Create output directory if it doesn't exist
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        # Generate the plots
+        metrics_path = os.path.join(output_dir, "training_metrics.png")
+        plot_training_metrics(self.metrics, metrics_path)
+
+        summary_path = os.path.join(output_dir, "performance_summary.png")
+        plot_performance_summary(self.metrics, summary_path)
+
+        progress_path = os.path.join(output_dir, "training_progress.png")
+        plot_training_progress(self.metrics, progress_path)
+
+        print(f"Metrics plots saved to {output_dir}")
 
 
 def main():
@@ -476,18 +559,18 @@ def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Train chess model with optimized performance")
     parser.add_argument("--data_dir", default="data", help="Directory containing PGN files")
-    parser.add_argument("--num_games", type=int, default=200000, help="Maximum number of games to process")
+    parser.add_argument("--num_games", type=int, default=100, help="Maximum number of games to process")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
-    parser.add_argument("--save_interval", type=int, default=1000, help="How often to save the model (in games)")
+    parser.add_argument("--save_interval", type=int, default=100, help="How often to save the model (in games)")
     parser.add_argument("--self_play", action="store_true", help="Run self-play training after PGN training")
-    parser.add_argument("--self_play_episodes", type=int, default=5000, help="Number of self-play episodes")
+    parser.add_argument("--self_play_episodes", type=int, default=1000, help="Number of self-play episodes")
+    #Mertcan stockfish = python main.py --stockfish_path "/opt/homebrew/Cellar/stockfish/17.1/bin/stockfish" --self_play
+    #Can stockfish = python main.py --stockfish_path "C:\\Users\\Can\\Documents\\stockfish\\stockfish-windows-x86-64-avx2.exe" --self_play
     parser.add_argument("--stockfish_path", default=None, help="Path to Stockfish executable")
-    parser.add_argument("--stockfish_opponent", action="store_true", default=True,
-                        help="Use Stockfish as opponent in self-play")
     parser.add_argument("--target_level", type=int, default=7,
                         help="Target Stockfish level to achieve")
-    parser.add_argument("--eval_interval", type=int, default=500,
-                        help="How often to evaluate against target level (in episodes)")
+    parser.add_argument("--eval_interval", type=int, default=200,
+                        help="How often to evaluate against Stockfish (in episodes)")
     parser.add_argument("--evaluate", action="store_true", help="Evaluate model against Stockfish levels")
     parser.add_argument("--eval_games", type=int, default=5, help="Number of games to play against each Stockfish level")
     parser.add_argument("--eval_model", help="Path to specific model to evaluate (optional)")
@@ -557,20 +640,19 @@ def main():
         print(f"Data directory not found: {args.data_dir}")
         print("Skipping PGN training phase")
 
-    # Continue with enhanced self-play training if requested
+    # Continue with pure self-play training if requested
     if args.self_play:
-        print("\nStarting advanced self-play training with curriculum learning...")
+        print("\nStarting pure self-play training (model vs itself and model pool)...")
         print(f"Target: Achieve Stockfish level {args.target_level} strength")
-        print("Using adaptive difficulty with Stockfish opponents")
+        print(f"Evaluation will occur every {args.eval_interval} games")
         print("Using model pool for diverse opponents")
         print("Using batch processing for better efficiency")
-        print("Using regular evaluation against target level")
+        print("Using comprehensive checkpointing for continuous training")
 
         # Run self-play training with improved parameters
         trainer.train_self_play(
             num_episodes=args.self_play_episodes,
-            stockfish_opponent=args.stockfish_opponent,
-            stockfish_levels=list(range(1, args.target_level + 1)),
+            stockfish_levels=[5, 6, 7],  # Focus on target levels for evaluation
             batch_size=args.batch_size,
             save_interval=args.save_interval,
             eval_interval=args.eval_interval,
