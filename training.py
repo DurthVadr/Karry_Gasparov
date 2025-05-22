@@ -241,6 +241,13 @@ class PGNTrainer:
                         # Display simple metrics
                         self.trainer.metrics.print_metrics()
 
+                        # Print cache statistics every 30 seconds
+                        if hasattr(self.trainer, 'reward_calculator') and \
+                           hasattr(self.trainer.reward_calculator, 'async_evaluator') and \
+                           self.trainer.reward_calculator.async_evaluator is not None:
+                            if current_time - last_report_time > 30:
+                                self.trainer.reward_calculator.async_evaluator.print_cache_stats()
+
                         last_report_time = current_time
 
                     # Save model periodically
@@ -978,6 +985,13 @@ class SelfPlayTrainer:
                 # Display metrics every 10 episodes
                 if (episode + 1) % 10 == 0:
                     self.trainer.metrics.print_metrics()
+
+                    # Print cache statistics every 50 episodes
+                    if (episode + 1) % 50 == 0 and \
+                       hasattr(self.trainer, 'reward_calculator') and \
+                       hasattr(self.trainer.reward_calculator, 'async_evaluator') and \
+                       self.trainer.reward_calculator.async_evaluator is not None:
+                        self.trainer.reward_calculator.async_evaluator.print_cache_stats()
 
             # Save model periodically
             if (episode + 1) % save_interval == 0:

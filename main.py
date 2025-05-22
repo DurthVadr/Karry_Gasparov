@@ -133,7 +133,7 @@ class ChessTrainer:
         self.reward_calculator = RewardCalculator(
             stockfish_path=stockfish_path,
             use_async=True,
-            num_workers=4  # Use 4 worker threads for parallel evaluation
+            num_workers=8  # Use 8 worker threads for parallel evaluation
         )
 
         # Initialize model evaluator
