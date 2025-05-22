@@ -114,13 +114,7 @@ class PGNTrainer:
 
     def _process_pgn_file(self, pgn_file, start_count, max_games, batch_size=32, save_interval=100):
         """
-        Process a single PGN file for training with optimized batch processing.
-
-        This improved version:
-        1. Collects positions in batches before processing
-        2. Uses vectorized operations where possible
-        3. Performs fewer Stockfish evaluations by sampling
-        4. Optimizes memory usage and tensor operations
+        Process a single PGN file for training.
 
         Args:
             pgn_file: Path to the PGN file
@@ -187,29 +181,20 @@ class PGNTrainer:
                         next_boards = [pos[2] for pos in batch_positions]
                         dones = [pos[3] for pos in batch_positions]
 
-                        # Calculate rewards in batch with adaptive sampling
+                        # Calculate rewards
                         rewards = []
-                        # Get current evaluation frequency (may be dynamic with hybrid approach)
-                        current_freq = self.trainer.reward_calculator.get_current_frequency()
-
-                        for curr_board, next_board in zip(current_boards, next_boards):
-                            # Use Stockfish evaluation based on configured frequency
-                            if random.random() < current_freq:
-                                # Use Stockfish for evaluation based on frequency
-                                reward = self.trainer.reward_calculator.calculate_stockfish_reward(next_board, curr_board)
-                            else:
-                                # Use faster material-based reward for other positions
-                                reward = self.trainer.reward_calculator.calculate_reward(next_board)
+                        for next_board in next_boards:
+                            # Use simple material-based reward
+                            reward = self.trainer.reward_calculator.calculate_reward(next_board)
                             rewards.append(reward)
 
-                        # Convert boards to tensors efficiently (in batch)
+                        # Convert boards to tensors
                         states = []
                         masks = []
                         next_states = []
                         next_masks = []
 
                         for curr_board, next_board in zip(current_boards, next_boards):
-                            # Convert to tensors and move to device in one operation
                             states.append(board_to_tensor(curr_board, self.trainer.device))
                             masks.append(create_move_mask(curr_board, self.trainer.device))
                             next_states.append(board_to_tensor(next_board, self.trainer.device))
@@ -224,36 +209,15 @@ class PGNTrainer:
 
                         # Perform optimization if enough samples
                         if len(self.trainer.memory) >= self.trainer.batch_size:
-                            # Use gradient accumulation if enabled
-                            if self.trainer.use_gradient_accumulation:
-                                # Determine which accumulation step we're on
-                                current_step = optimization_steps % self.trainer.accumulation_steps
-
-                                # Perform optimization with gradient accumulation
-                                loss = self.trainer.optimize_model(
-                                    accumulate_gradients=True,
-                                    accumulation_steps=self.trainer.accumulation_steps,
-                                    current_step=current_step
-                                )
-
-                                # Only count as a full optimization step at the end of accumulation
-                                if current_step == self.trainer.accumulation_steps - 1:
-                                    if loss is not None:
-                                        losses.append(loss)
-                                    optimization_steps += 1
-                                elif loss is not None:
-                                    # Still track loss for intermediate steps
-                                    losses.append(loss)
-                            else:
-                                # Standard optimization without gradient accumulation
-                                loss = self.trainer.optimize_model()
-                                if loss is not None:
-                                    losses.append(loss)
-                                    optimization_steps += 1
+                            # Standard optimization
+                            loss = self.trainer.optimize_model()
+                            if loss is not None:
+                                losses.append(loss)
+                                optimization_steps += 1
 
                     game_count += 1
 
-                    # Update target network periodically based on optimization steps
+                    # Update target network periodically
                     if optimization_steps > 0 and optimization_steps % self.trainer.target_update == 0:
                         self.trainer.target_net.load_state_dict(self.trainer.policy_net.state_dict())
 
@@ -267,57 +231,12 @@ class PGNTrainer:
                         print(f"Processed {start_count + game_count} games | {position_count} positions | "
                               f"{positions_per_second:.1f} pos/sec | Avg Loss: {avg_loss:.4f}")
 
-                        # Display simple metrics
-                        self.trainer.metrics.print_metrics()
-
-                        # Print cache statistics every 30 seconds
-                        if hasattr(self.trainer, 'reward_calculator') and \
-                           hasattr(self.trainer.reward_calculator, 'async_evaluator') and \
-                           self.trainer.reward_calculator.async_evaluator is not None:
-                            if current_time - last_report_time > 30:
-                                self.trainer.reward_calculator.async_evaluator.print_cache_stats()
-
                         last_report_time = current_time
 
                     # Save model periodically
                     if game_count % save_interval == 0:
                         checkpoint_path = f"model_pgn_{start_count + game_count}.pt"
                         self.trainer.save_model(checkpoint_path)
-
-                        # Calculate average loss for scheduler
-                        avg_loss = sum(losses[-100:]) / max(len(losses[-100:]), 1) if losses else 0
-
-                        # Apply learning rate scheduling with loss value for ReduceLROnPlateau
-                        self.trainer.scheduler.step(avg_loss)
-
-                        # Get current learning rate
-                        current_lr = self.trainer.optimizer.param_groups[0]['lr']
-                        print(f"Current learning rate: {current_lr:.6f}")
-
-                        # Print current training metrics
-                        print("\n=== Current Training Metrics ===")
-                        self.trainer.print_training_metrics()
-
-                        # Evaluate the checkpoint model if Stockfish is available
-                        if self.trainer.stockfish_path:
-                            print(f"\n=== Evaluating checkpoint model: {checkpoint_path} ===")
-                            # Use a smaller number of games for faster evaluation during training
-                            results = self.trainer.model_evaluator.evaluate_against_stockfish(
-                                model_path=os.path.join(self.trainer.model_dir, checkpoint_path),
-                                num_games=3,  # Fewer games for quicker evaluation
-                                stockfish_levels=[1, 3, 5]  # Test against a few key levels
-                            )
-
-                            # Print brief summary
-                            if results:
-                                # Determine approximate Stockfish level of the model
-                                best_comparable_level = 0
-                                for level in sorted(results.keys()):
-                                    if results[level]['score'] >= 0.45:  # Model is competitive (45%+ score)
-                                        best_comparable_level = level
-
-                                strength_msg = f"Stockfish level {best_comparable_level}" if best_comparable_level > 0 else "below Stockfish level 1"
-                                print(f"\nCheckpoint Evaluation: Model strength ~ {strength_msg}")
 
         except Exception as e:
             print(f"Error processing file {pgn_file}: {e}")
@@ -329,14 +248,7 @@ class PGNTrainer:
 
 class SelfPlayTrainer:
     """
-    Advanced self-play training with enhanced curriculum learning.
-
-    This trainer implements:
-    - Adaptive curriculum learning based on win rate, draw rate, and game quality
-    - Non-linear difficulty progression for more natural learning
-    - Phase-aware exploration strategies
-    - Diverse opponent pool with strategic selection
-    - Comprehensive evaluation metrics
+    Simple self-play training for chess reinforcement learning.
     """
 
     def __init__(self, trainer):
@@ -348,261 +260,44 @@ class SelfPlayTrainer:
         """
         self.trainer = trainer
 
-        # Curriculum learning parameters
-        self.curriculum_params = {
-            'win_threshold': 0.52,       # Base win rate threshold for advancing (slightly lower for faster progression)
-            'draw_threshold': 0.30,      # Draw rate threshold for consideration (higher to value draws more)
-            'quality_threshold': 0.33,   # Game quality threshold (lowered for faster progression)
-            'window_size': 75,           # Number of games to calculate metrics over (increased for more stable assessment)
-            'difficulty_scale': [        # Non-linear difficulty scale
-                {'level': 1, 'factor': 1.0},
-                {'level': 2, 'factor': 1.2},
-                {'level': 3, 'factor': 1.5},
-                {'level': 4, 'factor': 1.8},
-                {'level': 5, 'factor': 2.2},
-                {'level': 6, 'factor': 2.7},
-                {'level': 7, 'factor': 3.3},
-                {'level': 8, 'factor': 4.0},
-                {'level': 9, 'factor': 5.0},
-                {'level': 10, 'factor': 6.0}
-            ],
-            'sublevel_steps': 3,         # Fewer sublevels for faster level progression
-            'regression_threshold': 0.25, # Lower threshold to avoid too much regression
-            'regression_grace_period': 2  # Number of consecutive poor windows before regression
-        }
-
         # Initialize position diversity module
         self.position_diversity = PositionDiversity()
 
-        # Initialize random move opponent parameters
-        self.random_move_pct = self.trainer.hyperparams['curriculum'].get('random_move_pct', 0.25)
-        self.random_move_decay = self.trainer.hyperparams['curriculum'].get('random_move_decay', 0.05)
-        self.random_move_min = self.trainer.hyperparams['curriculum'].get('random_move_min', 0.05)
-        self.random_win_rate_threshold = self.trainer.hyperparams['curriculum'].get('random_win_rate_threshold', 0.70)
+        # Simple parameters for random move opponents
+        self.random_move_pct = 0.25  # 25% random moves
+        self.current_random_move_pct = self.random_move_pct
 
-        # Track random opponent statistics
-        self.random_opponent_games = 0
-        self.random_opponent_wins = 0
-        self.current_random_move_pct = self.random_move_pct  # Start with initial percentage
+    # Helper methods removed to simplify the codebase
 
-    def _calculate_effective_level(self, level, sublevel):
+    def _evaluate_move_quality(self, board, move, stockfish, depth=8):
         """
-        Calculate the effective difficulty level based on current level and sublevel.
-
-        This creates a smoother progression between integer difficulty levels.
-
-        Args:
-            level (int): Current curriculum level
-            sublevel (int): Current sublevel within the level
-
-        Returns:
-            float: Effective difficulty level
-        """
-        # Calculate fractional level for smoother progression
-        sublevel_fraction = (sublevel - 1) / self.curriculum_params['sublevel_steps']
-        return level + sublevel_fraction
-
-    def _update_opponent_weights(self, weights, level):
-        """
-        Update opponent selection weights based on curriculum level.
-
-        Args:
-            weights (dict): Dictionary of opponent weights to update
-            level (int): Current curriculum level
-        """
-        # Adjust weights based on level
-        if level <= 2:
-            # More random opponents at early levels for exploration
-            weights['random'] = 0.3
-            weights['self'] = 0.5
-            weights['pool'] = 0.2
-        elif level <= 5:
-            # Balanced mix in middle levels
-            weights['random'] = 0.1
-            weights['self'] = 0.4
-            weights['pool'] = 0.5
-        else:
-            # More pool opponents at higher levels for challenge
-            weights['random'] = 0.05
-            weights['self'] = 0.25
-            weights['pool'] = 0.7
-
-    def _select_opponent_type(self, weights):
-        """
-        Select opponent type using weighted random selection.
-
-        Args:
-            weights (dict): Dictionary of opponent weights
-
-        Returns:
-            str: Selected opponent type ('self', 'pool', or 'random')
-        """
-        # Normalize weights
-        total = sum(weights.values())
-        normalized_weights = {k: v/total for k, v in weights.items()}
-
-        # Weighted random selection
-        r = random.random()
-        cumulative = 0
-        for opponent_type, weight in normalized_weights.items():
-            cumulative += weight
-            if r <= cumulative:
-                return opponent_type
-
-        # Default to self-play if something goes wrong
-        return 'self'
-
-    def _select_appropriate_pool_model(self, model_pool, metadata, target_level):
-        """
-        Select an appropriate model from the pool based on curriculum level.
-
-        Args:
-            model_pool (list): List of models in the pool
-            metadata (list): List of model metadata
-            target_level (float): Target difficulty level
-
-        Returns:
-            nn.Module: Selected model from the pool
-        """
-        if not model_pool:
-            raise ValueError("Model pool is empty")
-
-        # Find models close to the target level
-        suitable_models = []
-        for i, _ in enumerate(model_pool):
-            # If model has a level attribute, use it
-            model_level = metadata[i].get('level', 1)
-
-            # Calculate distance from target level
-            level_distance = abs(model_level - target_level)
-
-            # Consider models within reasonable distance
-            if level_distance <= 2:
-                suitable_models.append((i, level_distance))
-
-        # If no suitable models found, use any model
-        if not suitable_models:
-            return random.choice(model_pool)
-
-        # Sort by distance (closest first)
-        suitable_models.sort(key=lambda x: x[1])
-
-        # Select from the closest models with some randomness
-        selection_pool = suitable_models[:min(3, len(suitable_models))]
-        selected_idx = random.choice(selection_pool)[0]
-
-        return model_pool[selected_idx]
-
-    def _evaluate_move_quality(self, board, move, stockfish, depth=12):
-        """
-        Evaluate the quality of a move compared to Stockfish's best move.
+        Simple evaluation of move quality.
 
         Args:
             board (chess.Board): Board position before the move
             move (chess.Move): The move to evaluate
             stockfish (chess.engine.SimpleEngine): Stockfish engine
-            depth (int): Evaluation depth
+            depth (int): Evaluation depth (reduced for speed)
 
         Returns:
             float: Move quality score (0-1)
         """
         try:
             # Get Stockfish's evaluation of the position
-            try:
-                result = stockfish.analyse(board, chess.engine.Limit(depth=depth))
-                stockfish_best_move = result.get("pv")[0]
-                stockfish_score = result.get("score").relative.score(mate_score=10000)
-            except Exception as e:
-                print(f"Move quality evaluation failed: engine event loop dead - {e}")
-                # Try to restart the engine - note that this returns a new engine instance
-                new_engine = self._restart_evaluation_engine(stockfish)
-                if new_engine:
-                    # We can't update the passed engine reference directly
-                    # The caller will need to handle this
-                    # Just return a default quality score
-                    return 0.5
-                else:
-                    # If restart fails, return a default score
-                    return 0.5
+            result = stockfish.analyse(board, chess.engine.Limit(depth=depth))
+            stockfish_best_move = result.get("pv")[0]
 
-            # Make the move to evaluate
-            board_copy = board.copy()
-            board_copy.push(move)
-
-            # Get Stockfish's evaluation after the move
-            try:
-                result_after = stockfish.analyse(board_copy, chess.engine.Limit(depth=depth))
-                move_score = -result_after.get("score").relative.score(mate_score=10000)
-            except Exception as e:
-                print(f"Move quality evaluation failed after move: {e}")
-                # Try to restart the engine - note that this returns a new engine instance
-                new_engine = self._restart_evaluation_engine(stockfish)
-                if new_engine:
-                    # We can't update the passed engine reference directly
-                    # The caller will need to handle this
-                    # Just return a default quality score
-                    return 0.5
-                else:
-                    # If restart fails, return a default score
-                    return 0.5
-
-            # Calculate the difference between the best move and the played move
+            # If the move matches Stockfish's best move, it's perfect
             if stockfish_best_move == move:
-                return 1.0  # Perfect move
+                return 1.0
 
-            # Calculate score difference
-            score_diff = abs(stockfish_score - move_score)
+            # Otherwise, return a medium quality score
+            return 0.5
 
-            # Convert score difference to quality (0-1)
-            # Small differences (< 50 centipawns) are still high quality
-            if score_diff < 50:
-                quality = 1.0 - (score_diff / 100)
-            # Medium differences (50-200 centipawns) are medium quality
-            elif score_diff < 200:
-                quality = 0.75 - ((score_diff - 50) / 600)
-            # Large differences (> 200 centipawns) are low quality
-            else:
-                quality = max(0.1, 0.5 - ((score_diff - 200) / 1600))
-
-            return max(0.0, min(1.0, quality))
         except Exception as e:
             # If evaluation fails, return a default medium quality
             print(f"Move quality evaluation failed: {e}")
             return 0.5
-
-    def _restart_evaluation_engine(self, stockfish):
-        """
-        Restart the Stockfish engine if it's not responding.
-
-        Args:
-            stockfish (chess.engine.SimpleEngine): The Stockfish engine to restart
-
-        Returns:
-            bool: True if restart was successful, False otherwise
-        """
-        # Import required modules
-        import time
-
-        try:
-            # Close the existing engine
-            try:
-                stockfish.quit()
-            except:
-                pass  # Ignore errors when closing
-
-            # Wait a moment before restarting to avoid rapid restart loops
-            time.sleep(1.0)
-
-            # Start a new engine
-            new_engine = chess.engine.SimpleEngine.popen_uci(self.trainer.stockfish_path)
-
-            # Replace the old engine reference with the new one
-            # Note: This is a bit tricky since we're passing the engine by reference
-            # We'll return the new engine and handle the replacement in the calling code
-            return new_engine
-        except Exception as e:
-            print(f"Failed to restart Stockfish engine: {e}")
-            return None
 
     def _count_material(self, board):
         """
@@ -633,26 +328,6 @@ class SelfPlayTrainer:
             total_material += (white_pieces + black_pieces) * piece_values[piece_type]
 
         return total_material
-
-    def _get_difficulty_factor(self, level):
-        """
-        Get the difficulty scaling factor for the current level.
-
-        Args:
-            level (int): Current curriculum level
-
-        Returns:
-            float: Difficulty scaling factor
-        """
-        # Find the difficulty factor from the scale
-        for entry in self.curriculum_params['difficulty_scale']:
-            if entry['level'] == level:
-                return entry['factor']
-
-        # Default to the factor for the closest level
-        closest_level = min(self.curriculum_params['difficulty_scale'],
-                           key=lambda x: abs(x['level'] - level))
-        return closest_level['factor']
 
     def train_self_play(self, num_episodes=5000, stockfish_levels=None,
                       batch_size=64, save_interval=100, eval_interval=1000, target_level=7):
