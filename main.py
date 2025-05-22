@@ -109,13 +109,13 @@ class ChessTrainer:
         elif scheduler_type == 'step':
             self.scheduler = torch.optim.lr_scheduler.StepLR(
                 self.optimizer,
-                step_size=5000,
+                step_size=2500,  # Reduced from 5000 for more frequent updates
                 gamma=self.hyperparams['optimizer']['lr_factor']
             )
         elif scheduler_type == 'cosine':
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer,
-                T_max=100000,
+                T_max=50000,  # Reduced from 100000 for more aggressive decay
                 eta_min=self.hyperparams['optimizer']['lr_min']
             )
 

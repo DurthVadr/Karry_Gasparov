@@ -16,10 +16,10 @@ NETWORK_CONFIG = {
 
 # Optimization Parameters
 OPTIMIZER_CONFIG = {
-    'learning_rate': 0.001,         # Initial learning rate
+    'learning_rate': 0.003,         # Initial learning rate (increased from 0.001 for faster initial learning)
     'lr_scheduler': 'plateau',      # Learning rate scheduler type ('step', 'plateau', 'cosine')
-    'lr_patience': 5,               # Patience for ReduceLROnPlateau scheduler
-    'lr_factor': 0.5,               # Factor by which to reduce learning rate
+    'lr_patience': 3,               # Patience for ReduceLROnPlateau scheduler (reduced for more aggressive decay)
+    'lr_factor': 0.3,               # Factor by which to reduce learning rate (reduced for more aggressive decay)
     'lr_min': 1e-6,                 # Minimum learning rate
     'weight_decay': 1e-4,           # L2 regularization factor
     'gradient_clip': 5.0,           # Gradient clipping threshold
