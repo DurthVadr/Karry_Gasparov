@@ -79,12 +79,26 @@ class ModelEvaluator:
         for level in stockfish_levels:
             print(f"\nEvaluating against Stockfish level {level}...")
 
-            # Configure Stockfish for this level
-            if self.stockfish:
-                self.stockfish.configure({"Skill Level": level})
-            else:
+            # Ensure Stockfish engine is available and running
+            if not self._ensure_stockfish_running():
                 print("Stockfish engine not available. Cannot evaluate.")
                 return None
+
+            # Configure Stockfish for this level
+            try:
+                self.stockfish.configure({"Skill Level": level})
+            except Exception as e:
+                print(f"Error configuring Stockfish: {e}")
+                # Try to restart the engine
+                if not self._restart_stockfish():
+                    print("Failed to restart Stockfish. Aborting evaluation.")
+                    return None
+                # Try to configure again
+                try:
+                    self.stockfish.configure({"Skill Level": level})
+                except Exception as e:
+                    print(f"Error configuring Stockfish after restart: {e}")
+                    return None
 
             # Track results for this level
             wins = 0
@@ -104,13 +118,32 @@ class ModelEvaluator:
                     # Model plays as white (first move)
                     if board.turn == chess.WHITE:
                         # Get move from our model
-                        model_move = agent.select_move(board)
-                        board.push(model_move)
+                        try:
+                            model_move = agent.select_move(board)
+                            board.push(model_move)
+                        except Exception as e:
+                            print(f"\nError getting model move: {e}")
+                            # End the game as a loss
+                            losses += 1
+                            print(" - Model error (counted as loss)")
+                            break
                     else:
                         # Get move from Stockfish
-                        result = self.stockfish.play(board, chess.engine.Limit(time=0.1))
-                        stockfish_move = result.move
-                        board.push(stockfish_move)
+                        try:
+                            result = self.stockfish.play(board, chess.engine.Limit(time=0.1))
+                            stockfish_move = result.move
+                            board.push(stockfish_move)
+                        except Exception as e:
+                            print(f"\nError getting Stockfish move: {e}")
+                            # Try to restart the engine
+                            if not self._restart_stockfish():
+                                print("Failed to restart Stockfish. Aborting game.")
+                                # Count as a draw
+                                draws += 1
+                                print(" - Engine error (counted as draw)")
+                                break
+                            # Skip this game and move to the next one
+                            continue
 
                     move_count += 1
 
@@ -118,17 +151,19 @@ class ModelEvaluator:
                     if board.is_game_over():
                         break
 
-                # Determine result
-                if board.is_checkmate():
-                    if board.turn == chess.BLACK:  # White (our model) won
-                        wins += 1
-                        print(" - Model won")
-                    else:  # Black (Stockfish) won
-                        losses += 1
-                        print(" - Stockfish won")
-                else:  # Draw
-                    draws += 1
-                    print(" - Draw")
+                # Skip result determination if we broke out due to an error
+                if move_count >= max_moves or board.is_game_over():
+                    # Determine result
+                    if board.is_checkmate():
+                        if board.turn == chess.BLACK:  # White (our model) won
+                            wins += 1
+                            print(" - Model won")
+                        else:  # Black (Stockfish) won
+                            losses += 1
+                            print(" - Stockfish won")
+                    else:  # Draw
+                        draws += 1
+                        print(" - Draw")
 
             # Store results for this level
             results[level] = {
@@ -166,7 +201,33 @@ class ModelEvaluator:
 
         return results
 
+    def _restart_stockfish(self):
+        """Restart the Stockfish engine if it's not responding."""
+        try:
+            # Close the existing engine if it exists
+            if self.stockfish:
+                try:
+                    self.stockfish.quit()
+                except:
+                    pass  # Ignore errors when closing
+
+            # Start a new engine
+            self.stockfish = chess.engine.SimpleEngine.popen_uci(self.stockfish_path)
+            return True
+        except Exception as e:
+            print(f"Failed to restart Stockfish: {e}")
+            return False
+
+    def _ensure_stockfish_running(self):
+        """Make sure Stockfish is running and available."""
+        if not self.stockfish:
+            return self._restart_stockfish()
+        return True
+
     def close(self):
         """Close the Stockfish engine if it's running."""
         if self.stockfish:
-            self.stockfish.quit()
+            try:
+                self.stockfish.quit()
+            except:
+                pass  # Ignore errors when closing

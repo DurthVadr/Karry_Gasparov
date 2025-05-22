@@ -84,6 +84,14 @@ class ChessTrainer:
         # Initialize networks
         self.policy_net = DQN().to(self.device)
         self.target_net = DQN().to(self.device)
+
+        # If using mixed precision, ensure model parameters are in the right format
+        if self.use_mixed_precision:
+            # Convert model parameters to float32 for mixed precision training
+            # (PyTorch's autocast will handle the conversion to float16 during forward pass)
+            self.policy_net = self.policy_net.to(dtype=torch.float32)
+            self.target_net = self.target_net.to(dtype=torch.float32)
+
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()  # Target network is only used for inference
 
@@ -319,9 +327,15 @@ class ChessTrainer:
                     self.target_net.load_state_dict(self.policy_net.state_dict())
                     print(f"Model state loaded from {filepath}")
 
-                # Make sure models are on the correct device
+                # Make sure models are on the correct device and dtype
                 self.policy_net.to(self.device)
                 self.target_net.to(self.device)
+
+                # If using mixed precision, ensure model parameters are in the right format
+                if self.use_mixed_precision:
+                    # Convert model parameters to float32 for mixed precision training
+                    self.policy_net = self.policy_net.to(dtype=torch.float32)
+                    self.target_net = self.target_net.to(dtype=torch.float32)
 
                 print(f"Model loaded successfully to {self.device}")
                 return True
@@ -496,14 +510,15 @@ class ChessTrainer:
         batch = Experience(*zip(*experiences))
 
         # Move tensors to the correct device with optimized GPU transfer
-        state_batch = torch.cat(batch.state).to(self.device, non_blocking=True)
+        # Ensure all tensors are in float32 format for consistent computation
+        state_batch = torch.cat(batch.state).to(self.device, non_blocking=True, dtype=torch.float32)
         action_batch = torch.tensor(batch.action, dtype=torch.long).unsqueeze(1).to(self.device, non_blocking=True)
         reward_batch = torch.tensor(batch.reward, dtype=torch.float32).to(self.device, non_blocking=True)
-        next_state_batch = torch.cat(batch.next_state).to(self.device, non_blocking=True)
+        next_state_batch = torch.cat(batch.next_state).to(self.device, non_blocking=True, dtype=torch.float32)
         done_batch = torch.tensor(batch.done, dtype=torch.bool).to(self.device, non_blocking=True)
-        mask_batch = torch.cat(batch.mask).to(self.device, non_blocking=True)
-        next_mask_batch = torch.cat(batch.next_mask).to(self.device, non_blocking=True)
-        weights = weights.detach().clone().to(self.device, non_blocking=True)
+        mask_batch = torch.cat(batch.mask).to(self.device, non_blocking=True, dtype=torch.float32)
+        next_mask_batch = torch.cat(batch.next_mask).to(self.device, non_blocking=True, dtype=torch.float32)
+        weights = weights.detach().clone().to(self.device, non_blocking=True, dtype=torch.float32)
 
         # Use CUDA streams for parallel data transfer if available
         if self.device.type == 'cuda':
@@ -511,38 +526,20 @@ class ChessTrainer:
 
         # Forward pass to get policy logits and value predictions
         if self.use_mixed_precision:
-            # Convert input tensors to FP16 for mixed precision training
-            if self.fp16_enabled:
-                # Convert state and mask tensors to float16 for forward pass
-                state_batch_fp16 = state_batch.to(dtype=torch.float16)
-                mask_batch_fp16 = mask_batch.to(dtype=torch.float16)
-                next_state_batch_fp16 = next_state_batch.to(dtype=torch.float16)
-                next_mask_batch_fp16 = next_mask_batch.to(dtype=torch.float16)
+            # Use autocast for mixed precision training - let PyTorch handle the conversions
+            with autocast(device_type='cuda', dtype=torch.float16):
+                # Forward pass for current state
+                policy_logits, value = self.policy_net(state_batch, mask_batch)
 
-                with autocast(device_type='cuda'):
-                    # Forward pass with FP16 tensors for current state
-                    policy_logits, value = self.policy_net(state_batch_fp16, mask_batch_fp16)
-
-                    # Get target values from target network
-                    with torch.no_grad():
-                        _, next_value = self.target_net(next_state_batch_fp16, next_mask_batch_fp16)
-                        # Set value to 0 for terminal states
-                        next_value[done_batch] = 0.0
-                        # Compute target value using TD(0)
-                        target_value = (next_value * self.gamma) + reward_batch.unsqueeze(1)
-            else:
-                # Use autocast without explicit conversion
-                with autocast(device_type='cuda'):
-                    # Forward pass for current state
-                    policy_logits, value = self.policy_net(state_batch, mask_batch)
-
-                    # Get target values from target network
-                    with torch.no_grad():
-                        _, next_value = self.target_net(next_state_batch, next_mask_batch)
-                        # Set value to 0 for terminal states
-                        next_value[done_batch] = 0.0
-                        # Compute target value using TD(0)
-                        target_value = (next_value * self.gamma) + reward_batch.unsqueeze(1)
+                # Get target values from target network
+                with torch.no_grad():
+                    _, next_value = self.target_net(next_state_batch, next_mask_batch)
+                    # Set value to 0 for terminal states
+                    next_value[done_batch] = 0.0
+                    # Compute target value using TD(0)
+                    # Ensure reward_batch is the same dtype as next_value
+                    reward_batch_fp16 = reward_batch.to(next_value.dtype)
+                    target_value = (next_value * self.gamma) + reward_batch_fp16.unsqueeze(1)
         else:
             # Standard full precision forward pass
             policy_logits, value = self.policy_net(state_batch, mask_batch)
@@ -562,16 +559,32 @@ class ChessTrainer:
 
         # Apply mask to policy logits to ensure only legal moves are considered
         masked_policy_logits = policy_logits.clone()
-        masked_policy_logits[mask_batch == 0] = -1e9  # Set logits for illegal moves to very negative value
+        # Use a smaller negative value that's compatible with float16 (half precision)
+        # FP16 range is approximately -65504 to 65504
+        masked_policy_logits[mask_batch == 0] = -1e4  # Set logits for illegal moves to very negative value
 
         # Compute policy loss (cross entropy between predicted policy and target policy)
-        # First convert logits to probabilities
-        policy_probs = F.softmax(masked_policy_logits, dim=1)
-        # Add small epsilon to avoid log(0)
-        policy_loss = -torch.sum(action_one_hot * torch.log(policy_probs + 1e-10), dim=1)
+        # First convert logits to probabilities with improved numerical stability
+        # Use log_softmax instead of softmax+log for better numerical stability
+        log_policy_probs = F.log_softmax(masked_policy_logits, dim=1)
+
+        # Check for NaN values and replace with zeros (should not happen with proper masking)
+        if torch.isnan(log_policy_probs).any():
+            print("Warning: NaN values detected in log_policy_probs, replacing with zeros")
+            log_policy_probs = torch.nan_to_num(log_policy_probs, nan=0.0)
+
+        # Compute cross-entropy loss directly with log probabilities
+        policy_loss = -torch.sum(action_one_hot * log_policy_probs, dim=1)
 
         # Compute value loss (MSE between predicted value and target value)
-        value_loss = F.mse_loss(value, target_value, reduction='none')
+        # Ensure value and target_value have the same dtype for mixed precision
+        if self.use_mixed_precision:
+            # Make sure both tensors are the same dtype (float16)
+            value_fp16 = value.to(torch.float16)
+            target_value_fp16 = target_value.to(torch.float16)
+            value_loss = F.mse_loss(value_fp16, target_value_fp16, reduction='none')
+        else:
+            value_loss = F.mse_loss(value, target_value, reduction='none')
 
         # Scale losses to avoid extremely low values
         # Typical policy loss might be around -log(0.1) = 2.3, while value loss might be around 0.1
@@ -583,7 +596,12 @@ class ChessTrainer:
         combined_loss = (policy_scale * policy_loss) + (value_scale * value_loss.squeeze())
 
         # Apply importance sampling weights from prioritized replay
-        weighted_loss = (combined_loss * weights).mean()
+        # Ensure weights have the same dtype as combined_loss for mixed precision
+        if self.use_mixed_precision:
+            weights_fp16 = weights.to(combined_loss.dtype)
+            weighted_loss = (combined_loss * weights_fp16).mean()
+        else:
+            weighted_loss = (combined_loss * weights).mean()
 
         # Compute TD errors for updating priorities (using combined loss)
         td_errors = combined_loss.detach().cpu().numpy()

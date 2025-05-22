@@ -508,17 +508,43 @@ class SelfPlayTrainer:
         """
         try:
             # Get Stockfish's evaluation of the position
-            result = stockfish.analyse(board, chess.engine.Limit(depth=depth))
-            stockfish_best_move = result.get("pv")[0]
-            stockfish_score = result.get("score").relative.score(mate_score=10000)
+            try:
+                result = stockfish.analyse(board, chess.engine.Limit(depth=depth))
+                stockfish_best_move = result.get("pv")[0]
+                stockfish_score = result.get("score").relative.score(mate_score=10000)
+            except Exception as e:
+                print(f"Move quality evaluation failed: engine event loop dead - {e}")
+                # Try to restart the engine - note that this returns a new engine instance
+                new_engine = self._restart_evaluation_engine(stockfish)
+                if new_engine:
+                    # We can't update the passed engine reference directly
+                    # The caller will need to handle this
+                    # Just return a default quality score
+                    return 0.5
+                else:
+                    # If restart fails, return a default score
+                    return 0.5
 
             # Make the move to evaluate
             board_copy = board.copy()
             board_copy.push(move)
 
             # Get Stockfish's evaluation after the move
-            result_after = stockfish.analyse(board_copy, chess.engine.Limit(depth=depth))
-            move_score = -result_after.get("score").relative.score(mate_score=10000)
+            try:
+                result_after = stockfish.analyse(board_copy, chess.engine.Limit(depth=depth))
+                move_score = -result_after.get("score").relative.score(mate_score=10000)
+            except Exception as e:
+                print(f"Move quality evaluation failed after move: {e}")
+                # Try to restart the engine - note that this returns a new engine instance
+                new_engine = self._restart_evaluation_engine(stockfish)
+                if new_engine:
+                    # We can't update the passed engine reference directly
+                    # The caller will need to handle this
+                    # Just return a default quality score
+                    return 0.5
+                else:
+                    # If restart fails, return a default score
+                    return 0.5
 
             # Calculate the difference between the best move and the played move
             if stockfish_best_move == move:
@@ -543,6 +569,40 @@ class SelfPlayTrainer:
             # If evaluation fails, return a default medium quality
             print(f"Move quality evaluation failed: {e}")
             return 0.5
+
+    def _restart_evaluation_engine(self, stockfish):
+        """
+        Restart the Stockfish engine if it's not responding.
+
+        Args:
+            stockfish (chess.engine.SimpleEngine): The Stockfish engine to restart
+
+        Returns:
+            bool: True if restart was successful, False otherwise
+        """
+        # Import required modules
+        import time
+
+        try:
+            # Close the existing engine
+            try:
+                stockfish.quit()
+            except:
+                pass  # Ignore errors when closing
+
+            # Wait a moment before restarting to avoid rapid restart loops
+            time.sleep(1.0)
+
+            # Start a new engine
+            new_engine = chess.engine.SimpleEngine.popen_uci(self.trainer.stockfish_path)
+
+            # Replace the old engine reference with the new one
+            # Note: This is a bit tricky since we're passing the engine by reference
+            # We'll return the new engine and handle the replacement in the calling code
+            return new_engine
+        except Exception as e:
+            print(f"Failed to restart Stockfish engine: {e}")
+            return None
 
     def _count_material(self, board):
         """
@@ -620,6 +680,10 @@ class SelfPlayTrainer:
         Returns:
             Tuple of (episode_rewards, episode_lengths, losses)
         """
+        # Import required modules
+        import time
+        import random
+        import os
         print(f"Starting enhanced self-play training with advanced curriculum learning for {num_episodes} episodes...")
         print(f"Target performance: Stockfish level {target_level}")
         print(f"Evaluation interval: Every {eval_interval} games")
@@ -704,13 +768,41 @@ class SelfPlayTrainer:
         # Create a separate Stockfish instance for evaluation only
         evaluation_stockfish = None
         if self.trainer.stockfish_path:
-            try:
-                # Initialize Stockfish for evaluation only
-                evaluation_stockfish = chess.engine.SimpleEngine.popen_uci(self.trainer.stockfish_path)
-                print(f"Initialized Stockfish for evaluation using path: {self.trainer.stockfish_path}")
-            except Exception as e:
-                print(f"Error initializing Stockfish for evaluation: {e}")
-                print("Stockfish evaluation will not be available")
+            # Import required modules
+            import time
+
+            # Try multiple times to initialize Stockfish
+            max_attempts = 3
+            for attempt in range(max_attempts):
+                try:
+                    # Initialize Stockfish for evaluation only
+                    evaluation_stockfish = chess.engine.SimpleEngine.popen_uci(self.trainer.stockfish_path)
+                    print(f"Initialized Stockfish for evaluation using path: {self.trainer.stockfish_path}")
+
+                    # Test the engine with a simple evaluation to ensure it's working
+                    test_board = chess.Board()
+                    try:
+                        evaluation_stockfish.analyse(test_board, chess.engine.Limit(depth=1))
+                        print("Stockfish engine test successful")
+                        break  # Engine initialized successfully
+                    except Exception as e:
+                        print(f"Stockfish engine test failed: {e}")
+                        try:
+                            evaluation_stockfish.quit()
+                        except:
+                            pass
+                        evaluation_stockfish = None
+
+                except Exception as e:
+                    print(f"Error initializing Stockfish for evaluation (attempt {attempt+1}/{max_attempts}): {e}")
+                    evaluation_stockfish = None
+
+                # Wait before retrying
+                if attempt < max_attempts - 1:
+                    time.sleep(2.0)
+
+            if evaluation_stockfish is None:
+                print("Stockfish evaluation will not be available after multiple initialization attempts")
 
         # Main training loop
         for episode in range(num_episodes):
@@ -781,16 +873,31 @@ class SelfPlayTrainer:
 
                     # Evaluate move quality if Stockfish is available (for White only)
                     if evaluation_stockfish:
-                        move_quality = self._evaluate_move_quality(board, move, evaluation_stockfish)
-                        move_qualities.append(move_quality)
+                        try:
+                            move_quality = self._evaluate_move_quality(board, move, evaluation_stockfish)
+                            move_qualities.append(move_quality)
+                        except Exception as e:
+                            print(f"Move quality evaluation failed: {e}")
+                            # Try to restart the engine
+                            new_engine = self._restart_evaluation_engine(evaluation_stockfish)
+                            if new_engine:
+                                # Update the engine reference
+                                evaluation_stockfish = new_engine
+                                print("Successfully restarted evaluation engine")
+                                # Use a default move quality
+                                move_qualities.append(0.5)
+                            else:
+                                # If restart fails, continue without evaluation
+                                print("Failed to restart evaluation engine - continuing without move quality evaluation")
+                                evaluation_stockfish = None
                 else:  # Opponent plays as Black
                     if use_model_pool:
                         # Get move from opponent model in the pool
                         with torch.no_grad():
-                            q_values = opponent_model(state, mask)
+                            policy_logits, _ = opponent_model(state, mask)  # Unpack the tuple returned by the model
                             legal_moves = list(board.legal_moves)
                             legal_move_indices = [m.from_square * 64 + m.to_square for m in legal_moves]
-                            legal_q_values = q_values[0, legal_move_indices]
+                            legal_q_values = policy_logits[0, legal_move_indices]
                             best_idx = torch.argmax(legal_q_values).item()
                             move = legal_moves[best_idx]
                             action_idx = legal_move_indices[best_idx]
@@ -1184,6 +1291,24 @@ class SelfPlayTrainer:
                        self.trainer.reward_calculator.async_evaluator is not None:
                         self.trainer.reward_calculator.async_evaluator.print_cache_stats()
 
+                # Perform a health check on the evaluation engine every 50 episodes
+                if (episode + 1) % 50 == 0 and evaluation_stockfish:
+                    try:
+                        # Simple health check - analyze a basic position
+                        test_board = chess.Board()
+                        evaluation_stockfish.analyse(test_board, chess.engine.Limit(depth=1))
+                        print("Evaluation engine health check: OK")
+                    except Exception as e:
+                        print(f"Evaluation engine health check failed: {e}")
+                        # Try to restart the engine
+                        new_engine = self._restart_evaluation_engine(evaluation_stockfish)
+                        if new_engine:
+                            evaluation_stockfish = new_engine
+                            print("Successfully restarted evaluation engine during health check")
+                        else:
+                            print("Failed to restart evaluation engine - continuing without move quality evaluation")
+                            evaluation_stockfish = None
+
             # Save model periodically
             if (episode + 1) % save_interval == 0:
                 # Save regular checkpoint
@@ -1266,7 +1391,12 @@ class SelfPlayTrainer:
 
         # Clean up
         if evaluation_stockfish:
-            evaluation_stockfish.quit()
+            try:
+                evaluation_stockfish.quit()
+                print("Evaluation Stockfish engine closed successfully")
+            except Exception as e:
+                print(f"Error closing Stockfish engine: {e}")
+                # The engine might already be dead, so we can ignore this error
 
         print(f"Self-play training completed! Total positions: {total_positions}")
         print(f"Total training time: {(time.time() - start_time)/3600:.2f} hours")

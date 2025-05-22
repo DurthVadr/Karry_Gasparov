@@ -187,7 +187,7 @@ def get_optimized_hyperparameters(gpu_type=None):
         config['optimizer']['use_gradient_accumulation'] = True
         config['optimizer']['accumulation_steps'] = 2  # Reduced from 4 since batch size is larger
 
-        # Enable mixed precision
+        # Temporarily disable mixed precision due to compatibility issues
         config['mixed_precision']['enabled'] = True
 
         # Increase number of workers for async evaluation

@@ -29,9 +29,10 @@ class MaskLayer(nn.Module):
         # Ensure mask is boolean or float tensor of 0s and 1s
         # Reshape mask to match the output shape if necessary
         mask_reshaped = mask.view_as(x)
-        # Apply mask: set invalid move scores to a very small number (or -inf)
-        # Using -inf ensures that softmax output for invalid moves is zero
-        masked_output = x.masked_fill(mask_reshaped == 0, -float("inf"))
+        # Apply mask: set invalid move scores to a very small number
+        # Using a large negative value ensures that softmax output for invalid moves is close to zero
+        # Use -1e4 instead of -inf for FP16 compatibility (FP16 range is approximately -65504 to 65504)
+        masked_output = x.masked_fill(mask_reshaped == 0, -1e4)
         return masked_output
 
 # Simplified Attention Module for faster processing
@@ -346,7 +347,8 @@ def simple_lookahead(board, policy_net, device, depth=1):
             return torch.argmax(policy_logits[0]).item()
 
     # For critical positions, do a simple lookahead
-    best_score = float('-inf')
+    # Use a very low value instead of -inf for FP16 compatibility
+    best_score = -1e4
     best_move_idx = None
 
     # Get legal moves
@@ -369,7 +371,8 @@ def simple_lookahead(board, policy_net, device, depth=1):
             opponent_mask = create_move_mask(board_copy, device)
 
             with torch.no_grad():
-                opponent_policy_logits, opponent_value = policy_net(opponent_state, opponent_mask)
+                # Only need policy logits for opponent's move selection
+                opponent_policy_logits, _ = policy_net(opponent_state, opponent_mask)
 
                 # Find opponent's best move
                 opponent_legal_moves = list(board_copy.legal_moves)
@@ -383,7 +386,8 @@ def simple_lookahead(board, policy_net, device, depth=1):
 
                     if board_copy.is_checkmate():
                         # If opponent can checkmate, this is a bad move
-                        score = float('-inf')
+                        # Use a very low value instead of -inf for FP16 compatibility
+                        score = -1e4
                     else:
                         # Evaluate resulting position
                         result_state = board_to_tensor(board_copy, device)
@@ -609,29 +613,26 @@ class ChessAgent:
                 # Import autocast for mixed precision inference
                 from torch.amp import autocast
 
-                # Convert tensors to FP16
-                state_tensor_fp16 = state_tensor.to(dtype=torch.float16)
-                move_mask_fp16 = move_mask.to(dtype=torch.float16)
-
                 # Use autocast for mixed precision inference
                 with autocast(device_type='cuda'):
-                    q_values = self.policy_net(state_tensor_fp16, move_mask_fp16)
+                    # No need to manually convert to fp16, autocast handles this
+                    policy_logits, value = self.policy_net(state_tensor, move_mask)
             else:
                 # Standard full precision inference
-                q_values = self.policy_net(state_tensor, move_mask)
+                policy_logits, value = self.policy_net(state_tensor, move_mask)
 
-            # Print some stats about the Q-values to help debug
-            if torch.isnan(q_values).any():
-                print("WARNING: NaN values detected in Q-values!")
+            # Print some stats about the policy_logits to help debug
+            if torch.isnan(policy_logits).any():
+                print("WARNING: NaN values detected in policy_logits!")
 
             # Get the legal move indices
             legal_move_indices = [m.from_square * 64 + m.to_square for m in board.legal_moves]
 
             # Apply repetition avoidance by penalizing moves that lead to repeated positions
-            adjusted_q_values = self._apply_repetition_penalties(board, q_values.clone())
+            adjusted_policy_logits = self._apply_repetition_penalties(board, policy_logits.clone())
 
-            # Get the adjusted Q-values for legal moves only
-            legal_adjusted_q_values = adjusted_q_values[0, legal_move_indices]
+            # Get the adjusted policy logits for legal moves only
+            legal_adjusted_policy_logits = adjusted_policy_logits[0, legal_move_indices]
 
             # Determine game phase for phase-aware exploration
             game_phase = self._determine_game_phase(board)
@@ -639,24 +640,24 @@ class ChessAgent:
             # Apply temperature-based selection with phase-aware adjustments
             temperature = self._get_phase_adjusted_temperature(game_phase)
 
-            # Apply temperature to Q-values (higher temperature = more exploration)
+            # Apply temperature to policy logits (higher temperature = more exploration)
             if temperature != 1.0:
                 # Apply softmax with temperature
-                legal_adjusted_q_values = legal_adjusted_q_values / temperature
+                legal_adjusted_policy_logits = legal_adjusted_policy_logits / temperature
 
             # Decide whether to use softmax sampling or greedy selection
             use_sampling = random.random() < self._get_phase_exploration_rate(game_phase)
 
             if use_sampling and len(legal_move_indices) > 1:
                 # Apply softmax to get probabilities
-                probabilities = F.softmax(legal_adjusted_q_values, dim=0)
+                probabilities = F.softmax(legal_adjusted_policy_logits, dim=0)
 
                 # Sample from the probability distribution
                 selected_idx = torch.multinomial(probabilities, 1).item()
                 best_move_index = legal_move_indices[selected_idx]
             else:
-                # Greedy selection - choose the move with highest Q-value
-                best_legal_index_in_list = torch.argmax(legal_adjusted_q_values).item()
+                # Greedy selection - choose the move with highest policy logit value
+                best_legal_index_in_list = torch.argmax(legal_adjusted_policy_logits).item()
                 best_move_index = legal_move_indices[best_legal_index_in_list]
 
             # Convert index to chess move coordinates
@@ -762,16 +763,16 @@ class ChessAgent:
             # Lower exploration in endgame for more precise play
             return 0.08  # Slightly increased but still low for endgame precision
 
-    def _apply_repetition_penalties(self, board, q_values):
+    def _apply_repetition_penalties(self, board, policy_logits):
         """
-        Apply penalties to Q-values for moves that lead to repeated positions.
+        Apply penalties to policy logits for moves that lead to repeated positions.
 
         Args:
             board (chess.Board): The current chess position
-            q_values (torch.Tensor): Q-values from the policy network
+            policy_logits (torch.Tensor): Policy logits from the policy network
 
         Returns:
-            torch.Tensor: Adjusted Q-values with repetition penalties applied
+            torch.Tensor: Adjusted policy logits with repetition penalties applied
         """
         # Get all legal moves
         legal_moves = list(board.legal_moves)
@@ -796,15 +797,15 @@ class ChessAgent:
                 # Apply increasingly severe penalties for repeated positions
                 if repetition_count == 1:
                     # First repetition: mild penalty
-                    q_values[0, move_idx] *= self.repetition_penalty
+                    policy_logits[0, move_idx] *= self.repetition_penalty
                 elif repetition_count == 2:
                     # Second repetition (would be a threefold repetition): severe penalty
-                    q_values[0, move_idx] *= (self.repetition_penalty ** 2)
+                    policy_logits[0, move_idx] *= (self.repetition_penalty ** 2)
                 else:
                     # More than two repetitions: extreme penalty
-                    q_values[0, move_idx] *= (self.repetition_penalty ** 3)
+                    policy_logits[0, move_idx] *= (self.repetition_penalty ** 3)
 
-        return q_values
+        return policy_logits
 
     def _update_position_history(self, board, move):
         """

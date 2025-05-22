@@ -1,0 +1,188 @@
+{
+  "openings": [
+    {
+      "name": "King's Pawn Opening",
+      "fen": "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1"
+    },
+    {
+      "name": "Queen's Pawn Opening",
+      "fen": "rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq d3 0 1"
+    },
+    {
+      "name": "English Opening",
+      "fen": "rnbqkbnr/pppppppp/8/8/2P5/8/PP1PPPPP/RNBQKBNR b KQkq c3 0 1"
+    },
+    {
+      "name": "Ruy Lopez",
+      "fen": "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3"
+    },
+    {
+      "name": "Italian Game",
+      "fen": "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3"
+    },
+    {
+      "name": "Sicilian Defense",
+      "fen": "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2"
+    },
+    {
+      "name": "French Defense",
+      "fen": "rnbqkbnr/ppp2ppp/4p3/3p4/3PP3/8/PPP2PPP/RNBQKBNR w KQkq - 0 3"
+    },
+    {
+      "name": "Caro-Kann Defense",
+      "fen": "rnbqkbnr/pp2pppp/2p5/3p4/3PP3/8/PPP2PPP/RNBQKBNR w KQkq - 0 3"
+    },
+    {
+      "name": "Pirc Defense",
+      "fen": "rnbqkb1r/ppp1pppp/3p1n2/8/3PP3/8/PPP2PPP/RNBQKBNR w KQkq - 2 3"
+    },
+    {
+      "name": "Queen's Gambit",
+      "fen": "rnbqkbnr/ppp1pppp/8/3p4/2PP4/8/PP2PPPP/RNBQKBNR b KQkq c3 0 2"
+    },
+    {
+      "name": "Queen's Gambit Accepted",
+      "fen": "rnbqkbnr/ppp1pppp/8/8/2pP4/8/PP2PPPP/RNBQKBNR w KQkq - 0 3"
+    },
+    {
+      "name": "Queen's Gambit Declined",
+      "fen": "rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/8/PP2PPPP/RNBQKBNR w KQkq - 0 3"
+    },
+    {
+      "name": "King's Indian Defense",
+      "fen": "rnbqkb1r/pppppp1p/5np1/8/2PP4/8/PP2PPPP/RNBQKBNR w KQkq - 0 3"
+    },
+    {
+      "name": "Nimzo-Indian Defense",
+      "fen": "rnbqk2r/pppp1ppp/4pn2/8/1bPP4/2N5/PP2PPPP/R1BQKBNR w KQkq - 2 4"
+    },
+    {
+      "name": "Dutch Defense",
+      "fen": "rnbqkbnr/ppppp1pp/8/5p2/3P4/8/PPP1PPPP/RNBQKBNR w KQkq f6 0 2"
+    },
+    {
+      "name": "Réti Opening",
+      "fen": "rnbqkbnr/ppp1pppp/8/3p4/8/5N2/PPPPPPPP/RNBQKB1R b KQkq - 1 2"
+    },
+    {
+      "name": "Scandinavian Defense",
+      "fen": "rnbqkbnr/ppp1pppp/8/3p4/4P3/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 2"
+    },
+    {
+      "name": "Alekhine's Defense",
+      "fen": "rnbqkb1r/pppppppp/5n2/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 1 2"
+    },
+    {
+      "name": "Modern Defense",
+      "fen": "rnbqkbnr/pppppp1p/6p1/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2"
+    },
+    {
+      "name": "Grünfeld Defense",
+      "fen": "rnbqkb1r/ppp1pp1p/5np1/3p4/2PP4/2N5/PP2PPPP/R1BQKBNR w KQkq d6 0 4"
+    }
+  ],
+  "middlegames": [
+    {
+      "name": "Open Center Middlegame",
+      "fen": "r1bq1rk1/ppp1bppp/2np1n2/4p3/2B1P3/2NP1N2/PPP2PPP/R1BQ1RK1 w - - 6 8"
+    },
+    {
+      "name": "Closed Center Middlegame",
+      "fen": "r1bq1rk1/pp1nbppp/2p1pn2/3p4/2PP4/2N1PN2/PP2BPPP/R1BQ1RK1 w - - 0 8"
+    },
+    {
+      "name": "Kingside Attack",
+      "fen": "r2q1rk1/ppp1bppp/2n1bn2/3p4/3P4/2NBP3/PPQ2PPP/R1B2RK1 w - - 0 10"
+    },
+    {
+      "name": "Queenside Attack",
+      "fen": "r2qk2r/1ppb1ppp/p1np1n2/4p3/B3P3/2PP1N2/PP3PPP/RNBQR1K1 b kq - 0 9"
+    },
+    {
+      "name": "Isolated Queen's Pawn",
+      "fen": "r1bqk2r/pp1n1ppp/2p1pn2/3p4/2PP4/P1Q5/1P2PPPP/R1B1KBNR w KQkq - 0 8"
+    },
+    {
+      "name": "Hanging Pawns",
+      "fen": "r1bq1rk1/pp1nbppp/4pn2/2pp4/3P4/2N1PN2/PP2BPPP/R1BQ1RK1 w - - 0 9"
+    },
+    {
+      "name": "Backward Pawn",
+      "fen": "r1bqkb1r/pp3ppp/2n1pn2/2pp4/3P4/2N1PN2/PP2BPPP/R1BQK2R w KQkq - 0 7"
+    },
+    {
+      "name": "Pawn Chain",
+      "fen": "rnbqk2r/ppp1bppp/4pn2/3p4/2PP4/2N2N2/PP2PPPP/R1BQKB1R w KQkq - 2 6"
+    },
+    {
+      "name": "Fianchetto Position",
+      "fen": "rnbq1rk1/ppp1ppbp/3p1np1/8/2PP4/2N2NP1/PP2PPBP/R1BQK2R b KQ - 0 7"
+    },
+    {
+      "name": "Open File",
+      "fen": "r3kb1r/pp2pppp/2n2n2/q1pp1b2/3P4/2N2NP1/PP2PPBP/R1BQ1RK1 w kq - 0 9"
+    }
+  ],
+  "endgames": [
+    {
+      "name": "King and Pawn vs King",
+      "fen": "8/8/8/8/8/4k3/4P3/4K3 w - - 0 1"
+    },
+    {
+      "name": "King and Pawn vs King (Black to move)",
+      "fen": "8/8/8/8/8/4K3/4p3/4k3 b - - 0 1"
+    },
+    {
+      "name": "Lucena Position",
+      "fen": "8/8/8/8/8/5k2/1R6/3K4 w - - 0 1"
+    },
+    {
+      "name": "Philidor Position",
+      "fen": "8/8/8/8/8/1k6/8/R3K3 w - - 0 1"
+    },
+    {
+      "name": "Queen vs Pawn",
+      "fen": "8/8/8/8/8/3k4/3p4/3KQ3 w - - 0 1"
+    },
+    {
+      "name": "Bishop and Knight Checkmate",
+      "fen": "8/8/8/8/8/3k4/8/3KBN2 w - - 0 1"
+    },
+    {
+      "name": "Two Bishops Endgame",
+      "fen": "8/8/8/8/8/3k4/8/2K5 w - - 0 1"
+    },
+    {
+      "name": "Rook Endgame",
+      "fen": "8/8/8/8/8/3k4/8/2K1R3 w - - 0 1"
+    },
+    {
+      "name": "Queen vs Rook",
+      "fen": "8/8/8/8/8/3k4/8/3KQr2 w - - 0 1"
+    },
+    {
+      "name": "Rook vs Knight",
+      "fen": "8/8/8/8/8/3k4/8/3KRn2 w - - 0 1"
+    },
+    {
+      "name": "Rook vs Bishop",
+      "fen": "8/8/8/8/8/3k4/8/3KRb2 w - - 0 1"
+    },
+    {
+      "name": "Rook and Pawn vs Rook",
+      "fen": "8/8/8/8/8/3k4/3P4/3KRr2 w - - 0 1"
+    },
+    {
+      "name": "Queen vs Pawn on 7th",
+      "fen": "8/3p4/8/8/8/3k4/8/3KQ3 w - - 0 1"
+    },
+    {
+      "name": "Knight Endgame",
+      "fen": "8/8/8/8/8/3k4/4N3/2K5 w - - 0 1"
+    },
+    {
+      "name": "Queen vs Knight",
+      "fen": "8/8/8/8/8/3k4/8/3KQn2 w - - 0 1"
+    }
+  ]
+}
