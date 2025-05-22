@@ -8,7 +8,9 @@ and checkmate rewards with simple fixed scaling.
 
 import chess
 import chess.engine
+import random
 from async_evaluation import AsyncStockfishEvaluator
+from position_clustering import PositionClusterCache
 
 class RewardCalculator:
     """
@@ -20,7 +22,8 @@ class RewardCalculator:
     """
 
     def __init__(self, stockfish_path=None, use_async=True, num_workers=8, stockfish_eval_frequency=0.2,
-                 hybrid_eval_enabled=False, low_freq_rate=0.01, high_freq_rate=0.2, high_freq_interval=50):
+                 hybrid_eval_enabled=False, low_freq_rate=0.01, high_freq_rate=0.2, high_freq_interval=50,
+                 use_position_clustering=True, cache_size=20000, similarity_threshold=0.85):
         """
         Initialize the reward calculator.
 
@@ -33,6 +36,9 @@ class RewardCalculator:
             low_freq_rate (float, optional): Low frequency rate for fast training
             high_freq_rate (float, optional): High frequency rate for quality training
             high_freq_interval (int, optional): Run high frequency evaluation every N episodes
+            use_position_clustering (bool, optional): Whether to use position clustering for cache
+            cache_size (int, optional): Size of evaluation cache
+            similarity_threshold (float, optional): Threshold for position similarity
         """
         self.stockfish = None
         self.async_evaluator = None
@@ -46,6 +52,11 @@ class RewardCalculator:
         self.high_freq_rate = high_freq_rate
         self.high_freq_interval = high_freq_interval
         self.current_episode = 0
+
+        # Position clustering parameters
+        self.use_position_clustering = use_position_clustering
+        self.cache_size = cache_size
+        self.similarity_threshold = similarity_threshold
 
         if self.hybrid_eval_enabled:
             print(f"Hybrid Stockfish evaluation enabled:")
@@ -68,8 +79,17 @@ class RewardCalculator:
                 print(f"Error initializing Stockfish engine: {e}")
                 print("Falling back to material-based evaluation")
 
-        # Cache for evaluation results
-        self.evaluation_cache = {}  # Simple cache for evaluation results
+        # Initialize cache
+        if self.use_position_clustering:
+            # Use position clustering cache for improved hit rates
+            self.cluster_cache = PositionClusterCache(
+                cache_size=self.cache_size,
+                similarity_threshold=self.similarity_threshold
+            )
+            print(f"Using position clustering cache with size {self.cache_size} and similarity threshold {self.similarity_threshold}")
+        else:
+            # Simple dictionary cache
+            self.evaluation_cache = {}  # Simple cache for evaluation results
 
     def calculate_stockfish_reward(self, board, prev_board=None):
         """
@@ -92,57 +112,117 @@ class RewardCalculator:
             eval_depth = 10  # Fixed depth for all evaluations
 
             # Check cache for this position
-            board_fen = board.fen()
-            if board_fen in self.evaluation_cache:
-                current_score = self.evaluation_cache[board_fen]
-            else:
-                # Get current board evaluation
-                if self.use_async and self.async_evaluator:
-                    # Use asynchronous evaluation
-                    current_score = self.async_evaluator.evaluate_position(board, depth=eval_depth)
-                    # Wait for the result
-                    result = self.async_evaluator.get_result(current_score, block=True)
-                    if result:
-                        current_score = result[1]
-                    else:
-                        # Fallback if async evaluation fails
-                        current_score = 0
+            if self.use_position_clustering:
+                # Use position clustering cache
+                cached_value, hit_type = self.cluster_cache.get(board)
+                if cached_value is not None:
+                    current_score = cached_value
+                    if hit_type == 'cluster':
+                        # If this was a cluster hit, print a message occasionally
+                        if random.random() < 0.01:  # Only print 1% of the time to avoid spam
+                            print(f"Position clustering cache hit: {hit_type}")
                 else:
-                    # Use synchronous evaluation
-                    current_score = self.stockfish.analyse(
-                        board=board,
-                        limit=chess.engine.Limit(depth=eval_depth)
-                    )['score'].relative.score(mate_score=10000)
-
-                # Cache the result
-                self.evaluation_cache[board_fen] = current_score
-
-            # Get previous board evaluation if available
-            prev_score = None
-            if prev_board is not None:
-                prev_board_fen = prev_board.fen()
-                if prev_board_fen in self.evaluation_cache:
-                    prev_score = self.evaluation_cache[prev_board_fen]
-                else:
+                    # Get current board evaluation
                     if self.use_async and self.async_evaluator:
                         # Use asynchronous evaluation
-                        prev_req = self.async_evaluator.evaluate_position(prev_board, depth=eval_depth)
+                        current_score = self.async_evaluator.evaluate_position(board, depth=eval_depth)
                         # Wait for the result
-                        result = self.async_evaluator.get_result(prev_req, block=True)
+                        result = self.async_evaluator.get_result(current_score, block=True)
                         if result:
-                            prev_score = result[1]
+                            current_score = result[1]
                         else:
                             # Fallback if async evaluation fails
-                            prev_score = 0
+                            current_score = 0
                     else:
                         # Use synchronous evaluation
-                        prev_score = self.stockfish.analyse(
-                            board=prev_board,
+                        current_score = self.stockfish.analyse(
+                            board=board,
+                            limit=chess.engine.Limit(depth=eval_depth)
+                        )['score'].relative.score(mate_score=10000)
+
+                    # Add to cluster cache
+                    self.cluster_cache.put(board, current_score)
+            else:
+                # Use simple dictionary cache
+                board_fen = board.fen()
+                if board_fen in self.evaluation_cache:
+                    current_score = self.evaluation_cache[board_fen]
+                else:
+                    # Get current board evaluation
+                    if self.use_async and self.async_evaluator:
+                        # Use asynchronous evaluation
+                        current_score = self.async_evaluator.evaluate_position(board, depth=eval_depth)
+                        # Wait for the result
+                        result = self.async_evaluator.get_result(current_score, block=True)
+                        if result:
+                            current_score = result[1]
+                        else:
+                            # Fallback if async evaluation fails
+                            current_score = 0
+                    else:
+                        # Use synchronous evaluation
+                        current_score = self.stockfish.analyse(
+                            board=board,
                             limit=chess.engine.Limit(depth=eval_depth)
                         )['score'].relative.score(mate_score=10000)
 
                     # Cache the result
-                    self.evaluation_cache[prev_board_fen] = prev_score
+                    self.evaluation_cache[board_fen] = current_score
+
+            # Get previous board evaluation if available
+            prev_score = None
+            if prev_board is not None:
+                if self.use_position_clustering:
+                    # Use position clustering cache
+                    cached_value, hit_type = self.cluster_cache.get(prev_board)
+                    if cached_value is not None:
+                        prev_score = cached_value
+                    else:
+                        # Get previous board evaluation
+                        if self.use_async and self.async_evaluator:
+                            # Use asynchronous evaluation
+                            prev_req = self.async_evaluator.evaluate_position(prev_board, depth=eval_depth)
+                            # Wait for the result
+                            result = self.async_evaluator.get_result(prev_req, block=True)
+                            if result:
+                                prev_score = result[1]
+                            else:
+                                # Fallback if async evaluation fails
+                                prev_score = 0
+                        else:
+                            # Use synchronous evaluation
+                            prev_score = self.stockfish.analyse(
+                                board=prev_board,
+                                limit=chess.engine.Limit(depth=eval_depth)
+                            )['score'].relative.score(mate_score=10000)
+
+                        # Add to cluster cache
+                        self.cluster_cache.put(prev_board, prev_score)
+                else:
+                    # Use simple dictionary cache
+                    prev_board_fen = prev_board.fen()
+                    if prev_board_fen in self.evaluation_cache:
+                        prev_score = self.evaluation_cache[prev_board_fen]
+                    else:
+                        if self.use_async and self.async_evaluator:
+                            # Use asynchronous evaluation
+                            prev_req = self.async_evaluator.evaluate_position(prev_board, depth=eval_depth)
+                            # Wait for the result
+                            result = self.async_evaluator.get_result(prev_req, block=True)
+                            if result:
+                                prev_score = result[1]
+                            else:
+                                # Fallback if async evaluation fails
+                                prev_score = 0
+                        else:
+                            # Use synchronous evaluation
+                            prev_score = self.stockfish.analyse(
+                                board=prev_board,
+                                limit=chess.engine.Limit(depth=eval_depth)
+                            )['score'].relative.score(mate_score=10000)
+
+                        # Cache the result
+                        self.evaluation_cache[prev_board_fen] = prev_score
 
             # Calculate reward based on evaluations
             if prev_score is not None:
@@ -298,6 +378,28 @@ class RewardCalculator:
             float: Current evaluation frequency
         """
         return self.stockfish_eval_frequency
+
+    def print_cache_stats(self):
+        """Print cache statistics."""
+        if self.use_position_clustering:
+            stats = self.cluster_cache.get_stats()
+            print("\n=== Position Clustering Cache Statistics ===")
+            print(f"Cache size: {stats['cache_size']} / {self.cache_size}")
+            print(f"Cluster count: {stats['cluster_count']}")
+            print(f"Exact hit rate: {stats['exact_hit_rate']:.2f}")
+            print(f"Cluster hit rate: {stats['cluster_hit_rate']:.2f}")
+            print(f"Total hit rate: {stats['total_hit_rate']:.2f}")
+            print(f"Total lookups: {stats['total_lookups']}")
+            print(f"Positions added: {stats['positions_added']}")
+            print("==========================================")
+        elif hasattr(self, 'evaluation_cache'):
+            print("\n=== Simple Cache Statistics ===")
+            print(f"Cache size: {len(self.evaluation_cache)}")
+            print("==============================")
+
+        # Print async evaluator stats if available
+        if self.async_evaluator:
+            self.async_evaluator.print_stats()
 
     def close(self):
         """Close the Stockfish engine and async evaluator if they're running."""

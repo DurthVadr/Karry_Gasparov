@@ -16,12 +16,13 @@ import os
 import random
 import numpy as np
 import torch
+import torch.nn.functional as F
 import chess
 import argparse
 
 # Import torch.amp for mixed precision training
 from torch.amp import GradScaler
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 
 # Import custom modules
 from drl_agent import DQN
@@ -333,105 +334,145 @@ class ChessTrainer:
             print(f"Model file {filepath} not found")
             return False
 
-    def select_action(self, state, mask, board):
+    def select_action(self, state, mask, board, is_root=False):
         """
-        Select an action using epsilon-greedy policy with improved exploration.
+        Select an action using AlphaZero-style temperature-based sampling with Dirichlet noise.
 
         Args:
             state (torch.Tensor): Current state tensor
             mask (torch.Tensor): Mask of legal moves
             board (chess.Board): Current board position
+            is_root (bool): Whether this is a root position (for Dirichlet noise)
 
         Returns:
             tuple: (action_idx, move) - The selected action index and chess move
         """
-        sample = random.random()
-        eps_threshold = self.eps_end + (self.eps_start - self.eps_end) * \
-                        np.exp(-1. * self.steps_done / self.eps_decay)
         self.steps_done += 1
 
-        # Update exploration rate metric
-        self.metrics.update_exploration(eps_threshold)
+        # Get legal moves
+        legal_moves = list(board.legal_moves)
+        legal_move_indices = [m.from_square * 64 + m.to_square for m in legal_moves]
 
         # Move tensors to the correct device
         state = state.to(self.device)
         mask = mask.to(self.device)
 
-        if sample > eps_threshold:
-            with torch.no_grad():
-                # Use policy network to select best action with FP16 if enabled
-                if self.use_mixed_precision and self.fp16_enabled:
-                    # Convert to FP16 for inference
-                    state_fp16 = state.to(dtype=torch.float16)
-                    mask_fp16 = mask.to(dtype=torch.float16)
+        # Check if this is a critical position that needs lookahead
+        is_critical = board.is_check() or any(board.is_capture(move) for move in legal_moves)
 
-                    # Use autocast for mixed precision inference
-                    with autocast('cuda'):
-                        q_values = self.policy_net(state_fp16, mask_fp16)
-                        # Clip Q-values to prevent drift
-                        q_values = torch.clamp(q_values, -10.0, 10.0)
-                else:
-                    # Standard full precision inference
-                    q_values = self.policy_net(state, mask)
-                    # Clip Q-values to prevent drift
-                    q_values = torch.clamp(q_values, -10.0, 10.0)
+        # For critical positions, use lookahead if enabled
+        if is_critical and self.hyperparams.get('use_lookahead', False):
+            from drl_agent import simple_lookahead
+            action_idx = simple_lookahead(board, self.policy_net, self.device,
+                                         depth=self.hyperparams.get('lookahead_depth', 1))
 
-                # Track average Q-values for monitoring
-                max_q_value = q_values.max().item()
-                if len(self.training_stats['avg_q_values']) < 1000:
-                    self.training_stats['avg_q_values'].append(max_q_value)
-                else:
-                    self.training_stats['avg_q_values'] = self.training_stats['avg_q_values'][1:] + [max_q_value]
+            # Convert action index to chess move
+            from_square = action_idx // 64
+            to_square = action_idx % 64
+            move = chess.Move(from_square, to_square)
 
-                # Track position seen
-                self.metrics.increment_positions()
+            # Handle promotion
+            piece = board.piece_at(from_square)
+            if piece and piece.piece_type == chess.PAWN:
+                if board.turn == chess.WHITE and chess.square_rank(to_square) == 7:
+                    move.promotion = chess.QUEEN
+                elif board.turn == chess.BLACK and chess.square_rank(to_square) == 0:
+                    move.promotion = chess.QUEEN
 
-                # Get the action with highest Q-value
-                action_idx = q_values.max(1)[1].item()
+            return action_idx, move
 
-                # Convert action index to chess move
-                from_square = action_idx // 64
-                to_square = action_idx % 64
+        with torch.no_grad():
+            # Use policy network to get policy and value with FP16 if enabled
+            if self.use_mixed_precision and self.fp16_enabled:
+                # Convert to FP16 for inference
+                state_fp16 = state.to(dtype=torch.float16)
+                mask_fp16 = mask.to(dtype=torch.float16)
 
-                # Check if this is a legal move
-                move = chess.Move(from_square, to_square)
+                # Use autocast for mixed precision inference
+                with autocast(device_type='cuda'):
+                    policy_logits, value = self.policy_net(state_fp16, mask_fp16)
+            else:
+                # Standard full precision inference
+                policy_logits, value = self.policy_net(state, mask)
 
-                # Handle promotion
-                piece = board.piece_at(from_square)
-                if piece and piece.piece_type == chess.PAWN:
-                    if board.turn == chess.WHITE and chess.square_rank(to_square) == 7:
-                        move.promotion = chess.QUEEN
-                    elif board.turn == chess.BLACK and chess.square_rank(to_square) == 0:
-                        move.promotion = chess.QUEEN
+            # Track position seen
+            self.metrics.increment_positions()
 
-                # If move is not legal, choose a legal move with highest Q-value
-                if move not in board.legal_moves:
-                    legal_moves = list(board.legal_moves)
-                    legal_move_indices = [m.from_square * 64 + m.to_square for m in legal_moves]
+            # Convert logits to probabilities
+            policy_probs = F.softmax(policy_logits, dim=1)
 
-                    # Get Q-values for legal moves only
-                    legal_q_values = q_values[0, legal_move_indices]
-                    best_legal_idx = torch.argmax(legal_q_values).item()
-                    move = legal_moves[best_legal_idx]
-                    action_idx = legal_move_indices[best_legal_idx]
-        else:
-            # Choose a random legal move
-            legal_moves = list(board.legal_moves)
-            move = random.choice(legal_moves)
-            action_idx = move.from_square * 64 + move.to_square
+            # Add Dirichlet noise at root positions if enabled
+            if is_root and self.hyperparams.get('use_dirichlet', False):
+                from drl_agent import add_dirichlet_noise
+                alpha = self.hyperparams.get('dirichlet_alpha', 0.3)
+                epsilon = self.hyperparams.get('dirichlet_epsilon', 0.25)
+                policy_probs = add_dirichlet_noise(policy_probs, legal_move_indices, alpha, epsilon)
+
+            # Apply temperature-based sampling
+            from drl_agent import temperature_sampling
+
+            # Get temperature based on game phase or steps
+            if self.hyperparams.get('use_phase_temperature', False):
+                # Determine game phase
+                piece_count = len(board.piece_map())
+                if piece_count >= 28:  # Opening
+                    temperature = self.hyperparams.get('opening_temperature', 1.0)
+                elif piece_count <= 12:  # Endgame
+                    temperature = self.hyperparams.get('endgame_temperature', 0.5)
+                else:  # Middlegame
+                    temperature = self.hyperparams.get('middlegame_temperature', 0.7)
+            else:
+                # Annealing temperature based on steps
+                temperature = max(
+                    self.hyperparams.get('min_temperature', 0.1),
+                    self.hyperparams.get('initial_temperature', 1.0) *
+                    np.exp(-self.steps_done / self.hyperparams.get('temperature_decay', 10000))
+                )
+
+            # Update exploration rate metric
+            self.metrics.update_exploration(temperature)
+
+            # Sample move based on policy probabilities and temperature
+            action_idx = temperature_sampling(policy_probs, legal_move_indices, temperature)
+
+            # Track average value for monitoring
+            value_scalar = value.item()
+            if len(self.training_stats.get('avg_values', [])) < 1000:
+                if 'avg_values' not in self.training_stats:
+                    self.training_stats['avg_values'] = []
+                self.training_stats['avg_values'].append(value_scalar)
+            else:
+                self.training_stats['avg_values'] = self.training_stats['avg_values'][1:] + [value_scalar]
+
+            # Convert action index to chess move
+            from_square = action_idx // 64
+            to_square = action_idx % 64
+            move = chess.Move(from_square, to_square)
+
+            # Handle promotion
+            piece = board.piece_at(from_square)
+            if piece and piece.piece_type == chess.PAWN:
+                if board.turn == chess.WHITE and chess.square_rank(to_square) == 7:
+                    move.promotion = chess.QUEEN
+                elif board.turn == chess.BLACK and chess.square_rank(to_square) == 0:
+                    move.promotion = chess.QUEEN
+
+            # Ensure the move is legal (should always be the case with our sampling)
+            if move not in legal_moves:
+                # Fallback to a random legal move if something went wrong
+                move = random.choice(legal_moves)
+                action_idx = move.from_square * 64 + move.to_square
 
         return action_idx, move
 
     def optimize_model(self, accumulate_gradients=False, accumulation_steps=1, current_step=0):
         """
-        Perform one step of optimization with prioritized experience replay.
+        Perform one step of optimization with AlphaZero-style combined policy and value loss.
 
         This implementation uses:
-        1. Double DQN to prevent overestimation bias
-           - Policy network selects actions
-           - Target network evaluates those actions
-        2. Q-value clipping to range [-10, 10] to prevent drift
-        3. Target network updates every 500 episodes
+        1. Policy loss: cross-entropy between predicted policy and target policy
+        2. Value loss: mean squared error between predicted value and target value
+        3. Combined loss with appropriate scaling to balance the two components
         4. Prioritized experience replay for better sample efficiency
         5. Gradient accumulation for effective larger batch sizes
 
@@ -468,8 +509,7 @@ class ChessTrainer:
         if self.device.type == 'cuda':
             torch.cuda.synchronize()  # Ensure all data is on GPU before proceeding
 
-        # Compute Q(s_t, a) - the model computes Q(s_t), then we select the columns of actions taken
-        # Use mixed precision for forward pass if available
+        # Forward pass to get policy logits and value predictions
         if self.use_mixed_precision:
             # Convert input tensors to FP16 for mixed precision training
             if self.fp16_enabled:
@@ -479,95 +519,85 @@ class ChessTrainer:
                 next_state_batch_fp16 = next_state_batch.to(dtype=torch.float16)
                 next_mask_batch_fp16 = next_mask_batch.to(dtype=torch.float16)
 
-                with autocast('cuda'):
-                    # Forward pass with FP16 tensors
-                    q_values = self.policy_net(state_batch_fp16, mask_batch_fp16)
-                    # Clip Q-values to prevent drift
-                    q_values = torch.clamp(q_values, -10.0, 10.0)
-                    state_action_values = q_values.gather(1, action_batch)
+                with autocast(device_type='cuda'):
+                    # Forward pass with FP16 tensors for current state
+                    policy_logits, value = self.policy_net(state_batch_fp16, mask_batch_fp16)
 
-                    # Compute V(s_{t+1}) for all next states using Double DQN
+                    # Get target values from target network
                     with torch.no_grad():
-                        # Get actions from policy network (Double DQN)
-                        next_q_values_policy = self.policy_net(next_state_batch_fp16, next_mask_batch_fp16)
-                        next_actions = next_q_values_policy.max(1)[1].unsqueeze(1)
-
-                        # Get Q-values from target network for those actions
-                        next_q_values_target = self.target_net(next_state_batch_fp16, next_mask_batch_fp16)
-                        next_state_values = next_q_values_target.gather(1, next_actions).squeeze(1)
-
-                        # Clip Q-values to prevent drift
-                        next_state_values = torch.clamp(next_state_values, -10.0, 10.0)
-
-                        # Set V(s) = 0 for terminal states
-                        next_state_values[done_batch] = 0.0
+                        _, next_value = self.target_net(next_state_batch_fp16, next_mask_batch_fp16)
+                        # Set value to 0 for terminal states
+                        next_value[done_batch] = 0.0
+                        # Compute target value using TD(0)
+                        target_value = (next_value * self.gamma) + reward_batch.unsqueeze(1)
             else:
                 # Use autocast without explicit conversion
-                with autocast('cuda'):
-                    q_values = self.policy_net(state_batch, mask_batch)
-                    # Clip Q-values to prevent drift
-                    q_values = torch.clamp(q_values, -10.0, 10.0)
-                    state_action_values = q_values.gather(1, action_batch)
+                with autocast(device_type='cuda'):
+                    # Forward pass for current state
+                    policy_logits, value = self.policy_net(state_batch, mask_batch)
 
-                    # Compute V(s_{t+1}) for all next states using Double DQN
+                    # Get target values from target network
                     with torch.no_grad():
-                        # Get actions from policy network (Double DQN)
-                        next_q_values_policy = self.policy_net(next_state_batch, next_mask_batch)
-                        next_actions = next_q_values_policy.max(1)[1].unsqueeze(1)
-
-                        # Get Q-values from target network for those actions
-                        next_q_values_target = self.target_net(next_state_batch, next_mask_batch)
-                        next_state_values = next_q_values_target.gather(1, next_actions).squeeze(1)
-
-                        # Clip Q-values to prevent drift
-                        next_state_values = torch.clamp(next_state_values, -10.0, 10.0)
-
-                        # Set V(s) = 0 for terminal states
-                        next_state_values[done_batch] = 0.0
+                        _, next_value = self.target_net(next_state_batch, next_mask_batch)
+                        # Set value to 0 for terminal states
+                        next_value[done_batch] = 0.0
+                        # Compute target value using TD(0)
+                        target_value = (next_value * self.gamma) + reward_batch.unsqueeze(1)
         else:
             # Standard full precision forward pass
-            q_values = self.policy_net(state_batch, mask_batch)
-            # Clip Q-values to prevent drift
-            q_values = torch.clamp(q_values, -10.0, 10.0)
-            state_action_values = q_values.gather(1, action_batch)
+            policy_logits, value = self.policy_net(state_batch, mask_batch)
 
-            # Compute V(s_{t+1}) for all next states using Double DQN
+            # Get target values from target network
             with torch.no_grad():
-                # Get actions from policy network (Double DQN)
-                next_q_values_policy = self.policy_net(next_state_batch, next_mask_batch)
-                next_actions = next_q_values_policy.max(1)[1].unsqueeze(1)
+                _, next_value = self.target_net(next_state_batch, next_mask_batch)
+                # Set value to 0 for terminal states
+                next_value[done_batch] = 0.0
+                # Compute target value using TD(0)
+                target_value = (next_value * self.gamma) + reward_batch.unsqueeze(1)
 
-                # Get Q-values from target network for those actions
-                next_q_values_target = self.target_net(next_state_batch, next_mask_batch)
-                next_state_values = next_q_values_target.gather(1, next_actions).squeeze(1)
+        # Create one-hot encoding of actions for policy loss
+        action_indices = action_batch.squeeze(1)
+        action_one_hot = torch.zeros(self.batch_size, 4096, device=self.device)
+        action_one_hot.scatter_(1, action_indices.unsqueeze(1), 1)
 
-                # Clip Q-values to prevent drift
-                next_state_values = torch.clamp(next_state_values, -10.0, 10.0)
+        # Apply mask to policy logits to ensure only legal moves are considered
+        masked_policy_logits = policy_logits.clone()
+        masked_policy_logits[mask_batch == 0] = -1e9  # Set logits for illegal moves to very negative value
 
-                # Set V(s) = 0 for terminal states
-                next_state_values[done_batch] = 0.0
+        # Compute policy loss (cross entropy between predicted policy and target policy)
+        # First convert logits to probabilities
+        policy_probs = F.softmax(masked_policy_logits, dim=1)
+        # Add small epsilon to avoid log(0)
+        policy_loss = -torch.sum(action_one_hot * torch.log(policy_probs + 1e-10), dim=1)
 
-        # Compute the expected Q values
-        expected_state_action_values = (next_state_values * self.gamma) + reward_batch
+        # Compute value loss (MSE between predicted value and target value)
+        value_loss = F.mse_loss(value, target_value, reduction='none')
 
-        # Compute TD errors for updating priorities
-        td_errors = torch.abs(state_action_values.squeeze() - expected_state_action_values).detach().cpu().numpy()
+        # Scale losses to avoid extremely low values
+        # Typical policy loss might be around -log(0.1) = 2.3, while value loss might be around 0.1
+        # We want to balance them so neither dominates
+        policy_scale = self.hyperparams.get('policy_loss_scale', 1.0)
+        value_scale = self.hyperparams.get('value_loss_scale', 1.0)
+
+        # Combine losses with appropriate scaling
+        combined_loss = (policy_scale * policy_loss) + (value_scale * value_loss.squeeze())
+
+        # Apply importance sampling weights from prioritized replay
+        weighted_loss = (combined_loss * weights).mean()
+
+        # Compute TD errors for updating priorities (using combined loss)
+        td_errors = combined_loss.detach().cpu().numpy()
 
         # Update priorities in memory
         self.memory.update_priorities(indices, td_errors + 1e-6)  # Small constant to avoid zero priority
 
-        # Compute weighted loss
-        criterion = torch.nn.SmoothL1Loss(reduction='none')
-        elementwise_loss = criterion(state_action_values, expected_state_action_values.unsqueeze(1))
-        loss = (elementwise_loss * weights.unsqueeze(1)).mean()
-
         # Scale loss by accumulation steps if accumulating gradients
         if accumulate_gradients:
-            loss = loss / accumulation_steps
+            weighted_loss = weighted_loss / accumulation_steps
 
         if self.use_mixed_precision:
             # Use mixed precision training
-            self.scaler.scale(loss).backward()
+            self.scaler.scale(weighted_loss).backward()
 
             # Only update weights at the end of accumulation
             if not accumulate_gradients or current_step == accumulation_steps - 1:
@@ -584,7 +614,7 @@ class ChessTrainer:
                     self.scheduler.step()
         else:
             # Standard full precision training
-            loss.backward()
+            weighted_loss.backward()
 
             # Only update weights at the end of accumulation
             if not accumulate_gradients or current_step == accumulation_steps - 1:
@@ -597,15 +627,31 @@ class ChessTrainer:
                     self.scheduler.step()
 
         # Update simple metrics
-        loss_value = loss.item()
+        loss_value = weighted_loss.item()
         if accumulate_gradients:
             loss_value *= accumulation_steps  # Scale back for reporting
 
         self.metrics.update_loss(loss_value)
 
-        # Update Q-value metrics if available
-        if hasattr(self, 'training_stats') and 'avg_q_values' in self.training_stats and self.training_stats['avg_q_values']:
-            self.metrics.update_q_value(self.training_stats['avg_q_values'][-1])
+        # Update value metrics if available
+        if hasattr(self, 'training_stats') and 'avg_values' in self.training_stats and self.training_stats['avg_values']:
+            self.metrics.update_q_value(self.training_stats['avg_values'][-1])
+
+        # Track separate policy and value losses for monitoring
+        if 'policy_losses' not in self.training_stats:
+            self.training_stats['policy_losses'] = []
+        if 'value_losses' not in self.training_stats:
+            self.training_stats['value_losses'] = []
+
+        policy_loss_mean = policy_loss.mean().item() * policy_scale
+        value_loss_mean = value_loss.mean().item() * value_scale
+
+        if len(self.training_stats['policy_losses']) < 1000:
+            self.training_stats['policy_losses'].append(policy_loss_mean)
+            self.training_stats['value_losses'].append(value_loss_mean)
+        else:
+            self.training_stats['policy_losses'] = self.training_stats['policy_losses'][1:] + [policy_loss_mean]
+            self.training_stats['value_losses'] = self.training_stats['value_losses'][1:] + [value_loss_mean]
 
         return loss_value
 
@@ -650,7 +696,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train chess model with optimized performance")
     parser.add_argument("--data_dir", default="data", help="Directory containing PGN files")
     parser.add_argument("--num_games", type=int, default=100, help="Maximum number of games to process")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
+    parser.add_argument("--batch_size", type=int, default=256, help="Batch size for training")
     parser.add_argument("--save_interval", type=int, default=100, help="How often to save the model (in games)")
     parser.add_argument("--self_play", action="store_true", help="Run self-play training after PGN training")
     parser.add_argument("--self_play_episodes", type=int, default=1000, help="Number of self-play episodes")

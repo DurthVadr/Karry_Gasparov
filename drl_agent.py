@@ -18,6 +18,7 @@ import torch.nn.functional as F
 import numpy as np
 import random
 import os
+from scipy.stats import dirichlet
 
 # Mask Layer for handling valid moves
 class MaskLayer(nn.Module):
@@ -146,7 +147,7 @@ class ChessFeatureExtractor(nn.Module):
 
 class DQN(nn.Module):
     """
-    Optimized Deep Q-Network for chess position evaluation with simplified architecture.
+    AlphaZero-style network for chess position evaluation with dual policy and value heads.
 
     Architecture:
     - Input: 16 channel 8x8 board representation
@@ -161,7 +162,9 @@ class DQN(nn.Module):
     - Simplified attention mechanism for faster processing
     - Reduced number of residual blocks (2 instead of 3)
     - Reduced channel count (32 instead of 64) for faster computation
-    - Output: 4096 Q-values (64x64 possible from-to square combinations)
+    - Dual output heads:
+      * Policy head: 4096 move probabilities (64x64 possible from-to square combinations)
+      * Value head: Single scalar value estimating position evaluation (-1 to 1)
 
     The network uses batch normalization, residual connections, simplified attention,
     and ReLU activations for better training stability and performance.
@@ -195,13 +198,17 @@ class DQN(nn.Module):
         self.conv_out = nn.Conv2d(channels, 64, kernel_size=3, stride=1, padding=1)
         self.bn_out = nn.BatchNorm2d(64)
 
-        # Fully connected layers for Q-value prediction with reduced size
-        # 64 features * 8x8 board = 4096 flattened features
-        self.fc1 = nn.Linear(64 * 64, 1024)  # Reduced hidden layer size
-        self.fc2 = nn.Linear(1024, 4096)     # Output: 64*64 = 4096 possible moves
+        # Shared representation layer
+        self.shared_fc = nn.Linear(64 * 64, 1024)
+        self.shared_dropout = nn.Dropout(0.2)
 
-        # Dropout for regularization
-        self.dropout = nn.Dropout(0.2)
+        # Policy head - outputs move probabilities
+        self.policy_fc = nn.Linear(1024, 4096)  # Output: 64*64 = 4096 possible moves
+
+        # Value head - outputs position evaluation
+        self.value_fc1 = nn.Linear(1024, 256)
+        self.value_dropout = nn.Dropout(0.2)
+        self.value_fc2 = nn.Linear(256, 1)  # Single scalar output
 
         # Mask layer to ensure only legal moves are considered
         self.mask_layer = MaskLayer()
@@ -225,17 +232,184 @@ class DQN(nn.Module):
         x = F.relu(self.bn_out(self.conv_out(x)))
 
         # Flatten the output for the fully connected layers
-        x = x.view(x.size(0), -1) # Flatten all dimensions except batch
+        x = x.view(x.size(0), -1)  # Flatten all dimensions except batch
 
-        # Apply fully connected layers with dropout
-        x = F.relu(self.fc1(x))
-        x = self.dropout(x)
-        x = self.fc2(x) # Raw scores for each move
+        # Shared representation
+        shared_features = F.relu(self.shared_fc(x))
+        shared_features = self.shared_dropout(shared_features)
 
+        # Policy head - outputs move probabilities
+        policy_logits = self.policy_fc(shared_features)  # Raw logits for each move
+
+        # Apply mask if provided
         if mask is not None:
-            x = self.mask_layer(x, mask)
+            policy_logits = self.mask_layer(policy_logits, mask)
 
-        return x
+        # Value head - outputs position evaluation
+        value_hidden = F.relu(self.value_fc1(shared_features))
+        value_hidden = self.value_dropout(value_hidden)
+        value = torch.tanh(self.value_fc2(value_hidden))  # Tanh to bound between -1 and 1
+
+        return policy_logits, value
+
+# AlphaZero-style helper functions
+def add_dirichlet_noise(policy_probs, legal_moves, alpha=0.3, epsilon=0.25):
+    """
+    Add Dirichlet noise to the policy probabilities at the root node.
+
+    Args:
+        policy_probs (torch.Tensor): Policy probabilities from the network
+        legal_moves (list): List of legal move indices
+        alpha (float): Dirichlet noise parameter (default: 0.3)
+        epsilon (float): Weight of noise to add (default: 0.25)
+
+    Returns:
+        torch.Tensor: Policy probabilities with added Dirichlet noise
+    """
+    # Create a copy of the policy probabilities
+    noisy_probs = policy_probs.clone()
+
+    # Generate Dirichlet noise for legal moves
+    noise = dirichlet.rvs([alpha] * len(legal_moves), size=1)[0]
+    noise_tensor = torch.tensor(noise, dtype=torch.float32, device=policy_probs.device)
+
+    # Apply noise only to legal moves
+    for i, move_idx in enumerate(legal_moves):
+        # Mix original probability with noise
+        noisy_probs[0, move_idx] = (1 - epsilon) * policy_probs[0, move_idx] + epsilon * noise_tensor[i]
+
+    # Renormalize probabilities for legal moves
+    legal_probs = noisy_probs[0, legal_moves]
+    legal_probs = legal_probs / legal_probs.sum()
+
+    # Update the noisy_probs tensor with normalized values
+    for i, move_idx in enumerate(legal_moves):
+        noisy_probs[0, move_idx] = legal_probs[i]
+
+    return noisy_probs
+
+def temperature_sampling(policy_probs, legal_moves, temperature=1.0):
+    """
+    Apply temperature to policy probabilities and sample a move.
+
+    Args:
+        policy_probs (torch.Tensor): Policy probabilities from the network
+        legal_moves (list): List of legal move indices
+        temperature (float): Temperature parameter (default: 1.0)
+            - temperature → 0: more deterministic (choose best move)
+            - temperature → ∞: more random (uniform distribution)
+
+    Returns:
+        int: Selected move index
+    """
+    # Extract probabilities for legal moves
+    legal_probs = policy_probs[0, legal_moves]
+
+    if temperature == 0:
+        # Deterministic selection (argmax)
+        selected_idx = torch.argmax(legal_probs).item()
+    else:
+        # Apply temperature scaling
+        scaled_probs = (legal_probs ** (1.0 / temperature))
+        # Renormalize
+        scaled_probs = scaled_probs / scaled_probs.sum()
+
+        # Sample from the distribution
+        selected_idx = torch.multinomial(scaled_probs, 1).item()
+
+    # Return the selected move index
+    return legal_moves[selected_idx]
+
+def simple_lookahead(board, policy_net, device, depth=1):
+    """
+    Perform a simple 1-2 ply lookahead for critical positions.
+
+    Args:
+        board (chess.Board): Current board position
+        policy_net (nn.Module): Policy network
+        device (torch.device): Device to run computations on
+        depth (int): Lookahead depth (1 or 2)
+
+    Returns:
+        int: Best move index after lookahead
+    """
+    # Check if this is a critical position (in check, or can capture a piece)
+    is_critical = board.is_check() or any(board.is_capture(move) for move in board.legal_moves)
+
+    if not is_critical or depth <= 0:
+        # For non-critical positions, just use the policy network directly
+        state = board_to_tensor(board, device)
+        mask = create_move_mask(board, device)
+
+        with torch.no_grad():
+            policy_logits, value = policy_net(state, mask)
+            return torch.argmax(policy_logits[0]).item()
+
+    # For critical positions, do a simple lookahead
+    best_score = float('-inf')
+    best_move_idx = None
+
+    # Get legal moves
+    legal_moves = list(board.legal_moves)
+    legal_move_indices = [m.from_square * 64 + m.to_square for m in legal_moves]
+
+    # Evaluate each move with lookahead
+    for i, move in enumerate(legal_moves):
+        # Make the move
+        board_copy = board.copy()
+        board_copy.push(move)
+
+        if board_copy.is_checkmate():
+            # Immediate checkmate is best
+            return legal_move_indices[i]
+
+        if depth > 1 and not board_copy.is_game_over():
+            # Opponent's best response
+            opponent_state = board_to_tensor(board_copy, device)
+            opponent_mask = create_move_mask(board_copy, device)
+
+            with torch.no_grad():
+                opponent_policy_logits, opponent_value = policy_net(opponent_state, opponent_mask)
+
+                # Find opponent's best move
+                opponent_legal_moves = list(board_copy.legal_moves)
+                if opponent_legal_moves:
+                    opponent_legal_indices = [m.from_square * 64 + m.to_square for m in opponent_legal_moves]
+                    opponent_best_idx = torch.argmax(opponent_policy_logits[0, opponent_legal_indices]).item()
+                    opponent_best_move = opponent_legal_moves[opponent_best_idx]
+
+                    # Make opponent's move
+                    board_copy.push(opponent_best_move)
+
+                    if board_copy.is_checkmate():
+                        # If opponent can checkmate, this is a bad move
+                        score = float('-inf')
+                    else:
+                        # Evaluate resulting position
+                        result_state = board_to_tensor(board_copy, device)
+                        result_mask = create_move_mask(board_copy, device)
+
+                        with torch.no_grad():
+                            _, result_value = policy_net(result_state, result_mask)
+                            score = result_value.item()
+                else:
+                    # No legal moves for opponent (stalemate)
+                    score = 0.0
+        else:
+            # Evaluate position after our move
+            state = board_to_tensor(board_copy, device)
+            mask = create_move_mask(board_copy, device)
+
+            with torch.no_grad():
+                _, value = policy_net(state, mask)
+                score = value.item()
+
+        # Update best move
+        if score > best_score:
+            best_score = score
+            best_move_idx = legal_move_indices[i]
+
+    return best_move_idx
 
 # Helper function to convert chess board to tensor representation
 # Optimized version for better performance
@@ -440,7 +614,7 @@ class ChessAgent:
                 move_mask_fp16 = move_mask.to(dtype=torch.float16)
 
                 # Use autocast for mixed precision inference
-                with autocast():
+                with autocast(device_type='cuda'):
                     q_values = self.policy_net(state_tensor_fp16, move_mask_fp16)
             else:
                 # Standard full precision inference

@@ -12,6 +12,7 @@ import chess.engine
 import numpy as np
 from drl_agent import DQN, board_to_tensor, create_move_mask
 from utils import plot_training_progress
+from position_diversity import PositionDiversity
 
 class PGNTrainer:
     """
@@ -370,6 +371,20 @@ class SelfPlayTrainer:
             'regression_grace_period': 2  # Number of consecutive poor windows before regression
         }
 
+        # Initialize position diversity module
+        self.position_diversity = PositionDiversity()
+
+        # Initialize random move opponent parameters
+        self.random_move_pct = self.trainer.hyperparams['curriculum'].get('random_move_pct', 0.25)
+        self.random_move_decay = self.trainer.hyperparams['curriculum'].get('random_move_decay', 0.05)
+        self.random_move_min = self.trainer.hyperparams['curriculum'].get('random_move_min', 0.05)
+        self.random_win_rate_threshold = self.trainer.hyperparams['curriculum'].get('random_win_rate_threshold', 0.70)
+
+        # Track random opponent statistics
+        self.random_opponent_games = 0
+        self.random_opponent_wins = 0
+        self.current_random_move_pct = self.random_move_pct  # Start with initial percentage
+
     def _calculate_effective_level(self, level, sublevel):
         """
         Calculate the effective difficulty level based on current level and sublevel.
@@ -716,14 +731,28 @@ class SelfPlayTrainer:
             if opponent_type == 'pool' and len(model_pool) > 0:
                 # Select a model from the pool based on curriculum level
                 opponent_model = self._select_appropriate_pool_model(model_pool, model_pool_metadata, effective_level)
+                opponent_model = opponent_model.to(self.trainer.device)
                 opponent_model.eval()  # Set to evaluation mode
                 use_model_pool = True
             elif opponent_type == 'random':
                 use_random_moves = True
             # else: use self-play (opponent_type == 'self')
 
-            # Initialize the game
+            # Initialize the game with position diversity
             board = chess.Board()
+
+            # Use position diversity if enabled
+            if self.trainer.hyperparams['self_play'].get('use_opening_book', False) and \
+               random.random() < self.trainer.hyperparams['self_play'].get('opening_book_frequency', 0.3):
+                # Use opening book position
+                board = self.position_diversity.get_random_opening_position()
+                print(f"Using opening book position: {board.fen()}")
+            elif self.trainer.hyperparams['self_play'].get('use_tablebase', False) and \
+                 random.random() < self.trainer.hyperparams['self_play'].get('tablebase_frequency', 0.2):
+                # Use endgame tablebase position
+                board = self.position_diversity.get_random_endgame_position()
+                print(f"Using endgame tablebase position: {board.fen()}")
+
             episode_reward = 0
             episode_length = 0
             positions_seen = {}  # Track positions for repetition detection
@@ -746,8 +775,9 @@ class SelfPlayTrainer:
                 mask = create_move_mask(board, self.trainer.device)
 
                 if board.turn == chess.WHITE:  # Our model plays as White
-                    # Select action using our policy with phase-aware exploration
-                    action_idx, move = self.trainer.select_action(state, mask, board)
+                    # Select action using our policy with AlphaZero-style exploration
+                    # Mark as root position for Dirichlet noise
+                    action_idx, move = self.trainer.select_action(state, mask, board, is_root=True)
 
                     # Evaluate move quality if Stockfish is available (for White only)
                     if evaluation_stockfish:
@@ -765,13 +795,27 @@ class SelfPlayTrainer:
                             move = legal_moves[best_idx]
                             action_idx = legal_move_indices[best_idx]
                     elif use_random_moves:
-                        # Choose a random legal move
+                        # Implement random move opponent with configurable randomness
                         legal_moves = list(board.legal_moves)
-                        move = random.choice(legal_moves)
-                        action_idx = move.from_square * 64 + move.to_square
+
+                        # Decide whether to make a random move based on current percentage
+                        if random.random() < self.current_random_move_pct:
+                            # Choose a completely random move
+                            move = random.choice(legal_moves)
+                            action_idx = move.from_square * 64 + move.to_square
+                        else:
+                            # Use the model to make a move (non-random)
+                            with torch.no_grad():
+                                policy_logits, _ = self.trainer.policy_net(state, mask)
+                                legal_move_indices = [m.from_square * 64 + m.to_square for m in legal_moves]
+                                legal_q_values = policy_logits[0, legal_move_indices]
+                                best_idx = torch.argmax(legal_q_values).item()
+                                move = legal_moves[best_idx]
+                                action_idx = legal_move_indices[best_idx]
                     else:
                         # Self-play against current policy (model plays against itself)
-                        action_idx, move = self.trainer.select_action(state, mask, board)
+                        # Not a root position for Black's moves
+                        action_idx, move = self.trainer.select_action(state, mask, board, is_root=False)
 
                 # Store current board for reward calculation
                 prev_board = board.copy()
@@ -902,6 +946,43 @@ class SelfPlayTrainer:
 
             # Update game outcomes history
             self.game_outcomes.append(game_outcome)
+
+            # Track statistics for random move opponents
+            if use_random_moves:
+                self.random_opponent_games += 1
+                if game_outcome == "win":
+                    self.random_opponent_wins += 1
+
+                # Calculate win rate against random opponents
+                if self.random_opponent_games >= 30:  # Need enough games for stable win rate
+                    random_win_rate = self.random_opponent_wins / self.random_opponent_games
+
+                    # Print current random opponent statistics
+                    print(f"Random opponent stats: {self.random_opponent_wins}/{self.random_opponent_games} " +
+                          f"({random_win_rate:.2f}) with {self.current_random_move_pct:.2f} randomness")
+
+                    # Adjust randomness based on win rate
+                    if random_win_rate >= 0.6:  # If winning more than 60% of games
+                        # Decrease randomness but not below minimum
+                        new_pct = max(self.current_random_move_pct - self.random_move_decay, self.random_move_min)
+                        if new_pct != self.current_random_move_pct:
+                            print(f"Decreasing random move percentage from {self.current_random_move_pct:.2f} to {new_pct:.2f}")
+                            self.current_random_move_pct = new_pct
+
+                    # Check if we should introduce Stockfish
+                    if random_win_rate >= self.random_win_rate_threshold:
+                        print(f"Win rate against random opponents ({random_win_rate:.2f}) has reached threshold " +
+                              f"({self.random_win_rate_threshold:.2f}). Ready to introduce Stockfish opponents.")
+
+                        # Update training stats to track this milestone
+                        if 'random_opponent_milestones' not in self.trainer.training_stats:
+                            self.trainer.training_stats['random_opponent_milestones'] = []
+
+                        self.trainer.training_stats['random_opponent_milestones'].append({
+                            'episode': episode,
+                            'win_rate': random_win_rate,
+                            'randomness': self.current_random_move_pct
+                        })
 
             # Update curriculum tracking
             self.games_at_current_level += 1

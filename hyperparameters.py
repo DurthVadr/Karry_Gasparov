@@ -26,6 +26,10 @@ OPTIMIZER_CONFIG = {
     'batch_size': 256,              # Batch size for training (increased for better GPU utilization)
     'accumulation_steps': 4,        # Number of batches to accumulate gradients over (effective batch size = batch_size * accumulation_steps)
     'use_gradient_accumulation': True, # Whether to use gradient accumulation
+
+    # AlphaZero-style loss parameters
+    'policy_loss_scale': 1.0,       # Scaling factor for policy loss
+    'value_loss_scale': 1.0,        # Scaling factor for value loss
 }
 
 # Experience Replay Parameters
@@ -53,12 +57,31 @@ REWARD_CONFIG = {
 
 # Exploration Parameters
 EXPLORATION_CONFIG = {
+    # Legacy epsilon-greedy parameters (kept for backward compatibility)
     'eps_start': 1.0,               # Starting epsilon for epsilon-greedy exploration
     'eps_end': 0.05,                # Final epsilon value
     'eps_decay': 100000,            # Number of steps to decay epsilon
-    'temperature': 1.0,             # Temperature for softmax action selection
-    'dirichlet_alpha': 0.3,         # Dirichlet noise alpha for root exploration
-    'noise_fraction': 0.25,         # Fraction of Dirichlet noise to add
+
+    # AlphaZero-style temperature-based sampling parameters
+    'use_temperature': True,        # Whether to use temperature-based sampling
+    'initial_temperature': 1.0,     # Initial temperature for exploration
+    'min_temperature': 0.1,         # Minimum temperature after annealing
+    'temperature_decay': 50000,     # Number of steps to decay temperature
+
+    # Phase-based temperature parameters
+    'use_phase_temperature': True,  # Whether to adjust temperature based on game phase
+    'opening_temperature': 1.2,     # Temperature for opening phase (more exploration)
+    'middlegame_temperature': 0.7,  # Temperature for middlegame phase
+    'endgame_temperature': 0.3,     # Temperature for endgame phase (more exploitation)
+
+    # Dirichlet noise parameters for root exploration
+    'use_dirichlet': True,          # Whether to add Dirichlet noise at root positions
+    'dirichlet_alpha': 0.3,         # Dirichlet noise concentration parameter
+    'dirichlet_epsilon': 0.25,      # Fraction of Dirichlet noise to add
+
+    # Lookahead for critical positions
+    'use_lookahead': True,          # Whether to use lookahead for critical positions
+    'lookahead_depth': 2,           # Depth of lookahead (1 or 2 ply)
 }
 
 # Curriculum Learning Parameters
@@ -67,6 +90,13 @@ CURRICULUM_CONFIG = {
     'win_rate_window': 30,          # Number of games to calculate win rate over
     'max_pool_size': 10,            # Maximum size of model pool
     'stockfish_levels': range(1, 11),  # Range of Stockfish levels to use
+
+    # Random move opponent parameters
+    'random_move_pct': 0.25,        # Initial percentage of random moves (25%)
+    'random_move_decay': 0.05,      # How much to decrease randomness when win rate improves
+    'random_move_min': 0.05,        # Minimum random move percentage
+    'random_win_rate_threshold': 0.70,  # Win rate threshold to introduce Stockfish (70%)
+    'position_diversity_enabled': True,  # Whether to use position diversity improvements
 }
 
 # Self-Play Parameters
@@ -78,6 +108,13 @@ SELF_PLAY_CONFIG = {
     'save_interval': 1000,          # Interval between saving models
     'target_update': 500,           # Interval between target network updates (reduced from 1000)
     'stockfish_time': 0.1,          # Time limit for Stockfish moves (seconds)
+
+    # Position diversity improvements
+    'use_opening_book': True,       # Whether to use opening book positions
+    'opening_book_frequency': 0.3,  # Frequency of using opening book positions (30%)
+    'use_tablebase': True,          # Whether to use endgame tablebase positions
+    'tablebase_frequency': 0.2,     # Frequency of using tablebase positions (20%)
+    'random_opponent_frequency': 0.6, # Frequency of playing against random move opponents (60%)
 }
 
 # Asynchronous Evaluation Parameters
@@ -87,6 +124,11 @@ ASYNC_EVAL_CONFIG = {
     'default_depth': 12,            # Default evaluation depth
     'critical_depth': 16,           # Depth for critical positions
     'enable_prefetch': True,        # Enable prefetching of evaluations
+
+    # Position diversity improvements
+    'use_position_clustering': True,  # Whether to use position clustering for cache
+    'cluster_size': 100,            # Size of position clusters
+    'similarity_threshold': 0.85,   # Threshold for position similarity
 }
 
 # Mixed Precision Parameters
@@ -170,6 +212,51 @@ def get_optimized_hyperparameters(gpu_type=None):
 
         # Increase target network update frequency to prevent Q-value drift
         config['self_play']['target_update'] = 250  # More frequent updates
+
+        # AlphaZero-style parameters
+        # Optimize loss scaling for better training stability
+        config['optimizer']['policy_loss_scale'] = 1.5  # Slightly emphasize policy learning
+        config['optimizer']['value_loss_scale'] = 1.0  # Base value for value learning
+
+        # Temperature-based sampling parameters
+        config['exploration']['use_temperature'] = True
+        config['exploration']['initial_temperature'] = 1.2  # Start with higher exploration
+        config['exploration']['min_temperature'] = 0.1  # End with more exploitation
+        config['exploration']['temperature_decay'] = 100000  # Decay over 100k steps
+
+        # Phase-based temperature parameters
+        config['exploration']['use_phase_temperature'] = True
+        config['exploration']['opening_temperature'] = 1.5  # More exploration in opening
+        config['exploration']['middlegame_temperature'] = 0.8  # Moderate in middlegame
+        config['exploration']['endgame_temperature'] = 0.3  # More exploitation in endgame
+
+        # Dirichlet noise parameters
+        config['exploration']['use_dirichlet'] = True
+        config['exploration']['dirichlet_alpha'] = 0.3  # Standard AlphaZero value
+        config['exploration']['dirichlet_epsilon'] = 0.25  # 25% noise, 75% network policy
+
+        # Lookahead for critical positions
+        config['exploration']['use_lookahead'] = True
+        config['exploration']['lookahead_depth'] = 2  # 2-ply lookahead for critical positions
+
+        # Random move opponent parameters
+        config['curriculum']['random_move_pct'] = 0.25  # Start with 25% random moves
+        config['curriculum']['random_move_decay'] = 0.05  # Decrease by 5% when win rate improves
+        config['curriculum']['random_move_min'] = 0.05  # Minimum 5% random moves
+        config['curriculum']['random_win_rate_threshold'] = 0.70  # 70% win rate to introduce Stockfish
+        config['curriculum']['position_diversity_enabled'] = True
+
+        # Position diversity improvements
+        config['self_play']['use_opening_book'] = True
+        config['self_play']['opening_book_frequency'] = 0.3
+        config['self_play']['use_tablebase'] = True
+        config['self_play']['tablebase_frequency'] = 0.2
+        config['self_play']['random_opponent_frequency'] = 0.6
+
+        # Position clustering for cache
+        config['async_eval']['use_position_clustering'] = True
+        config['async_eval']['cluster_size'] = 100
+        config['async_eval']['similarity_threshold'] = 0.85
 
     # Optimize for M2 Mac
 
