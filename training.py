@@ -316,8 +316,8 @@ class SelfPlayTrainer:
         self.curriculum_params = {
             'win_threshold': 0.52,       # Base win rate threshold for advancing (slightly lower for faster progression)
             'draw_threshold': 0.30,      # Draw rate threshold for consideration (higher to value draws more)
-            'quality_threshold': 0.55,   # Game quality threshold (slightly lower for faster progression)
-            'window_size': 30,           # Number of games to calculate metrics over (smaller window for faster adaptation)
+            'quality_threshold': 0.33,   # Game quality threshold (lowered for faster progression)
+            'window_size': 75,           # Number of games to calculate metrics over (increased for more stable assessment)
             'difficulty_scale': [        # Non-linear difficulty scale
                 {'level': 1, 'factor': 1.0},
                 {'level': 2, 'factor': 1.2},
@@ -331,7 +331,8 @@ class SelfPlayTrainer:
                 {'level': 10, 'factor': 6.0}
             ],
             'sublevel_steps': 3,         # Fewer sublevels for faster level progression
-            'regression_threshold': 0.25  # Lower threshold to avoid too much regression
+            'regression_threshold': 0.25, # Lower threshold to avoid too much regression
+            'regression_grace_period': 2  # Number of consecutive poor windows before regression
         }
 
     def _calculate_effective_level(self, level, sublevel):
@@ -544,10 +545,13 @@ class SelfPlayTrainer:
         print(f"Evaluation interval: Every {eval_interval} games")
         print(f"Using non-linear difficulty progression with {self.curriculum_params['sublevel_steps']} sublevels per level")
         print(f"Considering win rate, draw rate, and game quality for curriculum advancement")
+        print(f"Using larger window size of {self.curriculum_params['window_size']} games for more stable assessment")
+        print(f"Quality threshold lowered to {self.curriculum_params['quality_threshold']} for faster progression")
+        print(f"Regression grace period: {self.curriculum_params['regression_grace_period']} consecutive poor windows")
 
         # Set default Stockfish levels for evaluation if not provided
         if stockfish_levels is None:
-            stockfish_levels = [5, 6, 7]  # Focus on target levels for evaluation
+            stockfish_levels = [1, 2, 3, 4, 5]  # Include lower levels for testing
 
         # Initialize tracking metrics
         self.trainer.training_stats['episode_rewards'] = []
@@ -569,6 +573,7 @@ class SelfPlayTrainer:
         self.wins_at_current_level = 0
         self.draws_at_current_level = 0
         self.quality_sum_at_current_level = 0
+        self.consecutive_poor_windows = 0  # Track consecutive windows with poor performance
 
         # Game outcome history for calculating metrics
         self.game_outcomes = []  # List of 'win', 'loss', 'draw'
@@ -817,11 +822,25 @@ class SelfPlayTrainer:
                     )
 
                 # Check if we should regress due to poor performance
-                should_regress = win_rate < self.curriculum_params['regression_threshold']
+                poor_performance = win_rate < self.curriculum_params['regression_threshold']
+
+                # Update consecutive poor windows counter
+                if poor_performance:
+                    self.consecutive_poor_windows += 1
+                    print(f"Poor performance window detected ({self.consecutive_poor_windows}/{self.curriculum_params['regression_grace_period']})")
+                else:
+                    # Reset counter if performance is acceptable
+                    self.consecutive_poor_windows = 0
+
+                # Only regress after grace period expires
+                should_regress = poor_performance and self.consecutive_poor_windows >= self.curriculum_params['regression_grace_period']
 
                 if should_advance:
                     # Advance to next sublevel
                     self.current_sublevel += 1
+                    # Reset poor windows counter on advancement
+                    self.consecutive_poor_windows = 0
+
                     if self.current_sublevel > self.curriculum_params['sublevel_steps']:
                         # Advance to next level
                         self.current_sublevel = 1
@@ -834,15 +853,20 @@ class SelfPlayTrainer:
                 elif should_regress:
                     # Regress to previous sublevel
                     self.current_sublevel -= 1
+                    # Reset poor windows counter after regression
+                    self.consecutive_poor_windows = 0
+
                     if self.current_sublevel < 1:
                         # Regress to previous level
                         self.current_level = max(1, self.current_level - 1)
                         self.current_sublevel = self.curriculum_params['sublevel_steps']
                         print(f"Curriculum regressed to level {self.current_level}.{self.current_sublevel} "
-                              f"due to poor performance (win rate: {win_rate:.2f})")
+                              f"due to persistent poor performance (win rate: {win_rate:.2f})")
                     else:
                         print(f"Curriculum regressed to sublevel {self.current_level}.{self.current_sublevel} "
-                              f"(win rate: {win_rate:.2f})")
+                              f"due to persistent poor performance (win rate: {win_rate:.2f})")
+                elif poor_performance:
+                    print(f"Performance below threshold but within grace period - maintaining level {self.current_level}.{self.current_sublevel}")
 
                 # Reset tracking for next window
                 self.games_at_current_level = 0

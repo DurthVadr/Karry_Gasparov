@@ -33,65 +33,46 @@ class MaskLayer(nn.Module):
         masked_output = x.masked_fill(mask_reshaped == 0, -float("inf"))
         return masked_output
 
-# Self-Attention Module for capturing long-range piece interactions
-class SelfAttention(nn.Module):
+# Simplified Attention Module for faster processing
+class SimplifiedAttention(nn.Module):
     """
-    Self-attention module for capturing long-range piece interactions on the chess board.
+    Simplified attention module for faster processing.
 
-    This module implements a simplified version of the attention mechanism from the
-    Transformer architecture, allowing the model to focus on relevant parts of the board
-    and capture complex piece relationships.
+    This is a lightweight alternative to the full self-attention mechanism,
+    using spatial attention rather than the more computationally expensive
+    self-attention from transformer architectures.
     """
-    def __init__(self, in_channels, key_dim=32):
-        super(SelfAttention, self).__init__()
-        self.key_dim = key_dim
+    def __init__(self, in_channels):
+        super(SimplifiedAttention, self).__init__()
 
-        # Projections for query, key, and value
-        self.query = nn.Conv2d(in_channels, key_dim, kernel_size=1)
-        self.key = nn.Conv2d(in_channels, key_dim, kernel_size=1)
-        self.value = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        # Spatial attention with fewer operations
+        self.conv_spatial = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.norm = nn.BatchNorm2d(in_channels)
 
-        # Output projection
-        self.out_proj = nn.Conv2d(in_channels, in_channels, kernel_size=1)
-
-        # Layer normalization for stability
-        self.norm = nn.LayerNorm([in_channels, 8, 8])
-
-        # Scaling factor for dot product attention
-        self.scale = torch.sqrt(torch.tensor(key_dim, dtype=torch.float32))
+        # Channel attention
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.channel_attn = nn.Sequential(
+            nn.Linear(in_channels, in_channels // 2),
+            nn.ReLU(),
+            nn.Linear(in_channels // 2, in_channels),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        # Apply layer normalization
+        # Store residual
         residual = x
-        x = self.norm(x)
 
-        # Get batch size and spatial dimensions
-        batch_size, _, height, width = x.size()
+        # Spatial attention - simpler than full self-attention
+        spatial = self.conv_spatial(x)
+        spatial = self.norm(spatial)
 
-        # Compute query, key, and value
-        q = self.query(x)  # B x key_dim x H x W
-        k = self.key(x)    # B x key_dim x H x W
-        v = self.value(x)  # B x in_channels x H x W
+        # Channel attention
+        b, c, _, _ = x.size()
+        channel = self.avg_pool(x).view(b, c)
+        channel = self.channel_attn(channel).view(b, c, 1, 1)
 
-        # Reshape for attention computation
-        q = q.view(batch_size, self.key_dim, -1).permute(0, 2, 1)  # B x (H*W) x key_dim
-        k = k.view(batch_size, self.key_dim, -1)                   # B x key_dim x (H*W)
-        v = v.view(batch_size, -1, height * width)                 # B x in_channels x (H*W)
-
-        # Compute attention scores
-        attn = torch.bmm(q, k) / self.scale  # B x (H*W) x (H*W)
-
-        # Apply softmax to get attention weights
-        attn = F.softmax(attn, dim=-1)
-
-        # Apply attention weights to values
-        out = torch.bmm(v, attn.permute(0, 2, 1))  # B x in_channels x (H*W)
-
-        # Reshape back to spatial dimensions
-        out = out.view(batch_size, -1, height, width)
-
-        # Apply output projection
-        out = self.out_proj(out)
+        # Apply attention
+        out = spatial * channel
 
         # Add residual connection
         return out + residual
@@ -121,50 +102,41 @@ class ResidualBlock(nn.Module):
 
 class ChessFeatureExtractor(nn.Module):
     """
-    Chess-specific feature extractor to encode domain knowledge.
+    Simplified chess-specific feature extractor to encode domain knowledge.
 
-    This module extracts chess-specific features like:
-    - Piece mobility
-    - King safety
+    This module extracts basic chess-specific features with reduced complexity:
     - Center control
-    - Pawn structure
+    - King safety
+    - Basic piece mobility
     """
     def __init__(self, in_channels):
         super(ChessFeatureExtractor, self).__init__()
 
-        # Convolutional layers for feature extraction
-        self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(32)
+        # Convolutional layers for feature extraction (reduced size)
+        self.conv1 = nn.Conv2d(in_channels, 16, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(16)
 
-        # Specialized feature detectors
-        # Mobility detector (3x3 kernels to detect piece movement patterns)
-        self.mobility_conv = nn.Conv2d(32, 16, kernel_size=3, padding=1)
+        # Simplified specialized feature detectors
+        # Combined mobility and center control detector
+        self.mobility_center_conv = nn.Conv2d(16, 8, kernel_size=3, padding=1)
 
-        # King safety detector (5x5 kernels to detect king surroundings)
-        self.king_safety_conv = nn.Conv2d(32, 16, kernel_size=5, padding=2)
+        # King safety detector
+        self.king_safety_conv = nn.Conv2d(16, 8, kernel_size=3, padding=1)
 
-        # Center control detector (focused on e4, d4, e5, d5)
-        self.center_conv = nn.Conv2d(32, 16, kernel_size=3, padding=1)
-
-        # Pawn structure detector
-        self.pawn_structure_conv = nn.Conv2d(32, 16, kernel_size=3, padding=1)
-
-        # Final integration layer
-        self.integration_conv = nn.Conv2d(64, in_channels, kernel_size=1)
+        # Final integration layer (reduced size)
+        self.integration_conv = nn.Conv2d(16, in_channels, kernel_size=1)
         self.bn_out = nn.BatchNorm2d(in_channels)
 
     def forward(self, x):
         # Initial feature extraction
         features = F.relu(self.bn1(self.conv1(x)))
 
-        # Extract specialized features
-        mobility = F.relu(self.mobility_conv(features))
+        # Extract simplified specialized features
+        mobility_center = F.relu(self.mobility_center_conv(features))
         king_safety = F.relu(self.king_safety_conv(features))
-        center_control = F.relu(self.center_conv(features))
-        pawn_structure = F.relu(self.pawn_structure_conv(features))
 
-        # Concatenate all specialized features
-        combined_features = torch.cat([mobility, king_safety, center_control, pawn_structure], dim=1)
+        # Concatenate simplified features
+        combined_features = torch.cat([mobility_center, king_safety], dim=1)
 
         # Integrate features
         enhanced_features = F.relu(self.bn_out(self.integration_conv(combined_features)))
@@ -174,8 +146,7 @@ class ChessFeatureExtractor(nn.Module):
 
 class DQN(nn.Module):
     """
-    Enhanced Deep Q-Network for chess position evaluation with attention mechanisms
-    and chess-specific knowledge encoding.
+    Optimized Deep Q-Network for chess position evaluation with simplified architecture.
 
     Architecture:
     - Input: 16 channel 8x8 board representation
@@ -187,15 +158,15 @@ class DQN(nn.Module):
 
     - Chess-specific feature extraction for domain knowledge encoding
     - Convolutional layers with residual connections extract spatial features
-    - Self-attention modules capture long-range piece interactions
-    - Adaptive number of residual blocks based on network configuration
-    - Separate policy and value heads for better learning
+    - Simplified attention mechanism for faster processing
+    - Reduced number of residual blocks (2 instead of 3)
+    - Reduced channel count (32 instead of 64) for faster computation
     - Output: 4096 Q-values (64x64 possible from-to square combinations)
 
-    The network uses batch normalization, residual connections, attention mechanisms,
+    The network uses batch normalization, residual connections, simplified attention,
     and ReLU activations for better training stability and performance.
     """
-    def __init__(self, num_residual_blocks=3, channels=64, attention_layers=1):
+    def __init__(self, num_residual_blocks=2, channels=32, attention_layers=1):
         super(DQN, self).__init__()
 
         # Network configuration
@@ -210,24 +181,24 @@ class DQN(nn.Module):
         # Chess-specific feature extractor
         self.chess_feature_extractor = ChessFeatureExtractor(16)
 
-        # Create dynamic number of residual blocks
+        # Create reduced number of residual blocks
         self.res_blocks = nn.ModuleList([
             ResidualBlock(channels) for _ in range(num_residual_blocks)
         ])
 
-        # Create dynamic number of attention layers
+        # Create simplified attention layers
         self.attention_modules = nn.ModuleList([
-            SelfAttention(channels) for _ in range(attention_layers)
+            SimplifiedAttention(channels) for _ in range(attention_layers)
         ])
 
         # Additional convolutional layer to increase feature maps
-        self.conv_out = nn.Conv2d(channels, 128, kernel_size=3, stride=1, padding=1)
-        self.bn_out = nn.BatchNorm2d(128)
+        self.conv_out = nn.Conv2d(channels, 64, kernel_size=3, stride=1, padding=1)
+        self.bn_out = nn.BatchNorm2d(64)
 
         # Fully connected layers for Q-value prediction with reduced size
-        # 128 features * 8x8 board = 8192 flattened features
-        self.fc1 = nn.Linear(128 * 64, 2048)  # Reduced hidden layer size
-        self.fc2 = nn.Linear(2048, 4096)      # Output: 64*64 = 4096 possible moves
+        # 64 features * 8x8 board = 4096 flattened features
+        self.fc1 = nn.Linear(64 * 64, 1024)  # Reduced hidden layer size
+        self.fc2 = nn.Linear(1024, 4096)     # Output: 64*64 = 4096 possible moves
 
         # Dropout for regularization
         self.dropout = nn.Dropout(0.2)

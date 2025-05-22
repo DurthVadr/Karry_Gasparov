@@ -68,7 +68,7 @@ SELF_PLAY_CONFIG = {
     'max_moves': 300,               # Maximum moves per game
     'eval_interval': 500,           # Interval between evaluations
     'save_interval': 1000,          # Interval between saving models
-    'target_update': 1000,          # Interval between target network updates
+    'target_update': 500,           # Interval between target network updates (reduced from 1000)
     'stockfish_time': 0.1,          # Time limit for Stockfish moves (seconds)
 }
 
@@ -106,10 +106,10 @@ EVAL_CONFIG = {
 def get_optimized_hyperparameters(gpu_type=None):
     """
     Get optimized hyperparameters for the current hardware.
-    
+
     Args:
         gpu_type (str, optional): GPU type to optimize for
-        
+
     Returns:
         dict: Dictionary of optimized hyperparameters
     """
@@ -126,20 +126,20 @@ def get_optimized_hyperparameters(gpu_type=None):
         'pgn': PGN_CONFIG.copy(),
         'eval': EVAL_CONFIG.copy(),
     }
-    
+
     # Optimize for RTX 4070
     if gpu_type == 'rtx_4070':
         # Increase batch size for better GPU utilization
         config['optimizer']['batch_size'] = 256
-        
+
         # Enable mixed precision
         config['mixed_precision']['enabled'] = True
-        
+
         # Increase number of workers for async evaluation
         config['async_eval']['num_workers'] = 6
-        
+
         # Optimize network architecture
         config['network']['channels'] = 128
         config['network']['fc_hidden_size'] = 4096
-    
+
     return config

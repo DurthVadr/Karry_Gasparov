@@ -354,9 +354,13 @@ class ChessTrainer:
                     # Use autocast for mixed precision inference
                     with autocast('cuda'):
                         q_values = self.policy_net(state_fp16, mask_fp16)
+                        # Clip Q-values to prevent drift
+                        q_values = torch.clamp(q_values, -10.0, 10.0)
                 else:
                     # Standard full precision inference
                     q_values = self.policy_net(state, mask)
+                    # Clip Q-values to prevent drift
+                    q_values = torch.clamp(q_values, -10.0, 10.0)
 
                 # Track average Q-values for monitoring
                 max_q_value = q_values.max().item()
@@ -408,6 +412,14 @@ class ChessTrainer:
         """
         Perform one step of optimization with prioritized experience replay.
 
+        This implementation uses:
+        1. Double DQN to prevent overestimation bias
+           - Policy network selects actions
+           - Target network evaluates those actions
+        2. Q-value clipping to range [-10, 10] to prevent drift
+        3. Target network updates every 500 episodes
+        4. Prioritized experience replay for better sample efficiency
+
         Returns:
             float: Loss value if optimization was performed, None otherwise
         """
@@ -442,33 +454,69 @@ class ChessTrainer:
 
                 with autocast('cuda'):
                     # Forward pass with FP16 tensors
-                    state_action_values = self.policy_net(state_batch_fp16, mask_batch_fp16).gather(1, action_batch)
+                    q_values = self.policy_net(state_batch_fp16, mask_batch_fp16)
+                    # Clip Q-values to prevent drift
+                    q_values = torch.clamp(q_values, -10.0, 10.0)
+                    state_action_values = q_values.gather(1, action_batch)
 
-                    # Compute V(s_{t+1}) for all next states
+                    # Compute V(s_{t+1}) for all next states using Double DQN
                     with torch.no_grad():
-                        next_q_values = self.target_net(next_state_batch_fp16, next_mask_batch_fp16)
-                        next_state_values = next_q_values.max(1)[0]
+                        # Get actions from policy network (Double DQN)
+                        next_q_values_policy = self.policy_net(next_state_batch_fp16, next_mask_batch_fp16)
+                        next_actions = next_q_values_policy.max(1)[1].unsqueeze(1)
+
+                        # Get Q-values from target network for those actions
+                        next_q_values_target = self.target_net(next_state_batch_fp16, next_mask_batch_fp16)
+                        next_state_values = next_q_values_target.gather(1, next_actions).squeeze(1)
+
+                        # Clip Q-values to prevent drift
+                        next_state_values = torch.clamp(next_state_values, -10.0, 10.0)
+
                         # Set V(s) = 0 for terminal states
                         next_state_values[done_batch] = 0.0
             else:
                 # Use autocast without explicit conversion
                 with autocast('cuda'):
-                    state_action_values = self.policy_net(state_batch, mask_batch).gather(1, action_batch)
+                    q_values = self.policy_net(state_batch, mask_batch)
+                    # Clip Q-values to prevent drift
+                    q_values = torch.clamp(q_values, -10.0, 10.0)
+                    state_action_values = q_values.gather(1, action_batch)
 
-                    # Compute V(s_{t+1}) for all next states
+                    # Compute V(s_{t+1}) for all next states using Double DQN
                     with torch.no_grad():
-                        next_q_values = self.target_net(next_state_batch, next_mask_batch)
-                        next_state_values = next_q_values.max(1)[0]
+                        # Get actions from policy network (Double DQN)
+                        next_q_values_policy = self.policy_net(next_state_batch, next_mask_batch)
+                        next_actions = next_q_values_policy.max(1)[1].unsqueeze(1)
+
+                        # Get Q-values from target network for those actions
+                        next_q_values_target = self.target_net(next_state_batch, next_mask_batch)
+                        next_state_values = next_q_values_target.gather(1, next_actions).squeeze(1)
+
+                        # Clip Q-values to prevent drift
+                        next_state_values = torch.clamp(next_state_values, -10.0, 10.0)
+
                         # Set V(s) = 0 for terminal states
                         next_state_values[done_batch] = 0.0
         else:
             # Standard full precision forward pass
-            state_action_values = self.policy_net(state_batch, mask_batch).gather(1, action_batch)
+            q_values = self.policy_net(state_batch, mask_batch)
+            # Clip Q-values to prevent drift
+            q_values = torch.clamp(q_values, -10.0, 10.0)
+            state_action_values = q_values.gather(1, action_batch)
 
-            # Compute V(s_{t+1}) for all next states
+            # Compute V(s_{t+1}) for all next states using Double DQN
             with torch.no_grad():
-                next_q_values = self.target_net(next_state_batch, next_mask_batch)
-                next_state_values = next_q_values.max(1)[0]
+                # Get actions from policy network (Double DQN)
+                next_q_values_policy = self.policy_net(next_state_batch, next_mask_batch)
+                next_actions = next_q_values_policy.max(1)[1].unsqueeze(1)
+
+                # Get Q-values from target network for those actions
+                next_q_values_target = self.target_net(next_state_batch, next_mask_batch)
+                next_state_values = next_q_values_target.gather(1, next_actions).squeeze(1)
+
+                # Clip Q-values to prevent drift
+                next_state_values = torch.clamp(next_state_values, -10.0, 10.0)
+
                 # Set V(s) = 0 for terminal states
                 next_state_values[done_batch] = 0.0
 
@@ -652,7 +700,7 @@ def main():
         # Run self-play training with improved parameters
         trainer.train_self_play(
             num_episodes=args.self_play_episodes,
-            stockfish_levels=[5, 6, 7],  # Focus on target levels for evaluation
+            stockfish_levels=[1, 2, 3, 4, 5],  # Include lower levels for testing
             batch_size=args.batch_size,
             save_interval=args.save_interval,
             eval_interval=args.eval_interval,
