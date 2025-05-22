@@ -44,6 +44,11 @@ REWARD_CONFIG = {
     'draw_reward': 0.0,             # Reward for draw
     'move_penalty': 0.01,           # Small penalty for each move to encourage faster wins
     'repetition_penalty': 0.95,     # Penalty factor for repeated positions
+    'stockfish_eval_frequency': 0.2, # Evaluate only 20% of positions with Stockfish
+    'hybrid_eval_enabled': False,   # Whether to use hybrid evaluation approach
+    'low_freq_rate': 0.01,          # Low frequency rate (1%) for fast training
+    'high_freq_rate': 0.2,          # High frequency rate (20%) for quality training
+    'high_freq_interval': 50        # Run high frequency evaluation every N episodes
 }
 
 # Exploration Parameters
@@ -134,11 +139,11 @@ def get_optimized_hyperparameters(gpu_type=None):
     # Optimize for RTX 4070
     if gpu_type == 'rtx_4070':
         # Increase batch size for better GPU utilization
-        config['optimizer']['batch_size'] = 256
+        config['optimizer']['batch_size'] = 512  # Increased from 256 for better GPU utilization
 
         # Enable gradient accumulation for effective larger batches
         config['optimizer']['use_gradient_accumulation'] = True
-        config['optimizer']['accumulation_steps'] = 4
+        config['optimizer']['accumulation_steps'] = 2  # Reduced from 4 since batch size is larger
 
         # Enable mixed precision
         config['mixed_precision']['enabled'] = True
@@ -146,7 +151,7 @@ def get_optimized_hyperparameters(gpu_type=None):
         # Increase number of workers for async evaluation
         config['async_eval']['num_workers'] = 8
         config['async_eval']['enable_prefetch'] = True
-        config['async_eval']['cache_size'] = 20000
+        config['async_eval']['cache_size'] = 50000  # Increased from 20000 for better cache hits
 
         # Optimize network architecture
         config['network']['channels'] = 128
@@ -155,5 +160,17 @@ def get_optimized_hyperparameters(gpu_type=None):
         # Reduce max moves per game for efficiency
         config['self_play']['max_moves'] = 250
         config['self_play']['early_stopping_no_progress'] = 30
+
+        # Enable hybrid Stockfish evaluation approach for optimal speed/quality balance
+        config['reward']['hybrid_eval_enabled'] = True
+        config['reward']['low_freq_rate'] = 0.01  # Use 1% frequency for most episodes (fast)
+        config['reward']['high_freq_rate'] = 0.1  # Use 10% frequency for quality episodes
+        config['reward']['high_freq_interval'] = 50  # Run high quality evaluation every 50 episodes
+        config['reward']['stockfish_eval_frequency'] = 0.01  # Default to 1% for maximum speed
+
+        # Increase target network update frequency to prevent Q-value drift
+        config['self_play']['target_update'] = 250  # More frequent updates
+
+    # Optimize for M2 Mac
 
     return config

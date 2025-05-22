@@ -129,11 +129,16 @@ class ChessTrainer:
             beta_start=memory_beta_start
         )
 
-        # Initialize reward calculator with asynchronous evaluation
+        # Initialize reward calculator with asynchronous evaluation and hybrid approach
         self.reward_calculator = RewardCalculator(
             stockfish_path=stockfish_path,
             use_async=True,
-            num_workers=8  # Use 8 worker threads for parallel evaluation
+            num_workers=self.hyperparams['async_eval']['num_workers'],
+            stockfish_eval_frequency=self.hyperparams['reward'].get('stockfish_eval_frequency', 0.2),
+            hybrid_eval_enabled=self.hyperparams['reward'].get('hybrid_eval_enabled', False),
+            low_freq_rate=self.hyperparams['reward'].get('low_freq_rate', 0.01),
+            high_freq_rate=self.hyperparams['reward'].get('high_freq_rate', 0.2),
+            high_freq_interval=self.hyperparams['reward'].get('high_freq_interval', 50)
         )
 
         # Initialize model evaluator with reference to this trainer
@@ -449,16 +454,19 @@ class ChessTrainer:
         experiences, indices, weights = self.memory.sample(self.batch_size)
         batch = Experience(*zip(*experiences))
 
-        # Move tensors to the correct device
-        state_batch = torch.cat(batch.state).to(self.device)
-        action_batch = torch.tensor(batch.action, dtype=torch.long).unsqueeze(1).to(self.device)
-        reward_batch = torch.tensor(batch.reward, dtype=torch.float32).to(self.device)
-        next_state_batch = torch.cat(batch.next_state).to(self.device)
-        done_batch = torch.tensor(batch.done, dtype=torch.bool).to(self.device)
-        mask_batch = torch.cat(batch.mask).to(self.device)
-        next_mask_batch = torch.cat(batch.next_mask).to(self.device)
-        weights = weights.detach().clone().to(self.device)
-        # weights = torch.tensor(weights, dtype=torch.float32).to(self.device) #uncomment for previous implementation
+        # Move tensors to the correct device with optimized GPU transfer
+        state_batch = torch.cat(batch.state).to(self.device, non_blocking=True)
+        action_batch = torch.tensor(batch.action, dtype=torch.long).unsqueeze(1).to(self.device, non_blocking=True)
+        reward_batch = torch.tensor(batch.reward, dtype=torch.float32).to(self.device, non_blocking=True)
+        next_state_batch = torch.cat(batch.next_state).to(self.device, non_blocking=True)
+        done_batch = torch.tensor(batch.done, dtype=torch.bool).to(self.device, non_blocking=True)
+        mask_batch = torch.cat(batch.mask).to(self.device, non_blocking=True)
+        next_mask_batch = torch.cat(batch.next_mask).to(self.device, non_blocking=True)
+        weights = weights.detach().clone().to(self.device, non_blocking=True)
+
+        # Use CUDA streams for parallel data transfer if available
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize()  # Ensure all data is on GPU before proceeding
 
         # Compute Q(s_t, a) - the model computes Q(s_t), then we select the columns of actions taken
         # Use mixed precision for forward pass if available
@@ -679,8 +687,9 @@ def main():
     print(f"Stockfish path: {args.stockfish_path}")
     print("==========================================\n")
 
-    # Create trainer with optimized hyperparameters for RTX 4070
-    trainer = ChessTrainer(stockfish_path=args.stockfish_path, gpu_type="rtx_4070")
+    # Create trainer with optimized hyperparameters for the detected hardware
+    gpu_type = "rtx_4070" if torch.cuda.is_available() and "RTX 4070" in torch.cuda.get_device_name(0) else "m2_mac"
+    trainer = ChessTrainer(stockfish_path=args.stockfish_path, gpu_type=gpu_type)
 
     print("\n🚀 GPU Diagnostic:")
     print("CUDA Available:", torch.cuda.is_available())

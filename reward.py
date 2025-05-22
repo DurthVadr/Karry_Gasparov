@@ -19,7 +19,8 @@ class RewardCalculator:
     It focuses on material advantage and checkmate rewards with simple fixed scaling.
     """
 
-    def __init__(self, stockfish_path=None, use_async=True, num_workers=8):
+    def __init__(self, stockfish_path=None, use_async=True, num_workers=8, stockfish_eval_frequency=0.2,
+                 hybrid_eval_enabled=False, low_freq_rate=0.01, high_freq_rate=0.2, high_freq_interval=50):
         """
         Initialize the reward calculator.
 
@@ -27,11 +28,31 @@ class RewardCalculator:
             stockfish_path (str, optional): Path to Stockfish executable
             use_async (bool, optional): Whether to use asynchronous evaluation
             num_workers (int, optional): Number of worker threads for async evaluation
+            stockfish_eval_frequency (float, optional): Frequency of Stockfish evaluations (0-1)
+            hybrid_eval_enabled (bool, optional): Whether to use hybrid evaluation approach
+            low_freq_rate (float, optional): Low frequency rate for fast training
+            high_freq_rate (float, optional): High frequency rate for quality training
+            high_freq_interval (int, optional): Run high frequency evaluation every N episodes
         """
         self.stockfish = None
         self.async_evaluator = None
         self.stockfish_path = stockfish_path
         self.use_async = use_async
+        self.stockfish_eval_frequency = stockfish_eval_frequency
+
+        # Hybrid evaluation parameters
+        self.hybrid_eval_enabled = hybrid_eval_enabled
+        self.low_freq_rate = low_freq_rate
+        self.high_freq_rate = high_freq_rate
+        self.high_freq_interval = high_freq_interval
+        self.current_episode = 0
+
+        if self.hybrid_eval_enabled:
+            print(f"Hybrid Stockfish evaluation enabled:")
+            print(f"  - Normal episodes: {self.low_freq_rate * 100:.1f}% evaluation frequency")
+            print(f"  - Quality episodes (every {self.high_freq_interval}): {self.high_freq_rate * 100:.1f}% evaluation frequency")
+        else:
+            print(f"Stockfish evaluation frequency set to {self.stockfish_eval_frequency * 100:.1f}%")
 
         if stockfish_path:
             try:
@@ -250,6 +271,33 @@ class RewardCalculator:
         return white_material - black_material if board.turn == chess.WHITE else black_material - white_material
 
     # Removed evaluate_position method - using calculate_positional_bonus instead
+
+    def update_episode(self, episode_num):
+        """
+        Update the current episode number for hybrid evaluation.
+
+        Args:
+            episode_num (int): Current episode number
+        """
+        self.current_episode = episode_num
+
+        # If hybrid evaluation is enabled, adjust the evaluation frequency
+        if self.hybrid_eval_enabled:
+            # Check if this is a "quality" episode
+            if episode_num % self.high_freq_interval == 0:
+                self.stockfish_eval_frequency = self.high_freq_rate
+                print(f"Episode {episode_num}: Using high quality evaluation ({self.high_freq_rate * 100:.1f}%)")
+            else:
+                self.stockfish_eval_frequency = self.low_freq_rate
+
+    def get_current_frequency(self):
+        """
+        Get the current Stockfish evaluation frequency.
+
+        Returns:
+            float: Current evaluation frequency
+        """
+        return self.stockfish_eval_frequency
 
     def close(self):
         """Close the Stockfish engine and async evaluator if they're running."""

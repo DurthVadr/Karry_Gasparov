@@ -188,11 +188,17 @@ class PGNTrainer:
 
                         # Calculate rewards in batch with adaptive sampling
                         rewards = []
-                        for j, (curr_board, next_board) in enumerate(zip(current_boards, next_boards)):
-                            # Use adaptive sampling based on position importance
-                            # The reward calculator will determine importance internally
-                            # and adjust evaluation depth accordingly
-                            reward = self.trainer.reward_calculator.calculate_stockfish_reward(next_board, curr_board)
+                        # Get current evaluation frequency (may be dynamic with hybrid approach)
+                        current_freq = self.trainer.reward_calculator.get_current_frequency()
+
+                        for curr_board, next_board in zip(current_boards, next_boards):
+                            # Use Stockfish evaluation based on configured frequency
+                            if random.random() < current_freq:
+                                # Use Stockfish for evaluation based on frequency
+                                reward = self.trainer.reward_calculator.calculate_stockfish_reward(next_board, curr_board)
+                            else:
+                                # Use faster material-based reward for other positions
+                                reward = self.trainer.reward_calculator.calculate_reward(next_board)
                             rewards.append(reward)
 
                         # Convert boards to tensors efficiently (in batch)
@@ -724,6 +730,10 @@ class SelfPlayTrainer:
             experiences = []  # Collect experiences for batch processing
             move_qualities = []  # Track quality of moves for game quality assessment
 
+            # Update reward calculator with current episode for hybrid evaluation
+            if hasattr(self.trainer.reward_calculator, 'update_episode'):
+                self.trainer.reward_calculator.update_episode(episode)
+
             # Track material for early stopping due to no progress
             last_material_change_move = 0
             last_material_count = self._count_material(board)
@@ -777,7 +787,16 @@ class SelfPlayTrainer:
                 done = board.is_game_over()
 
                 # Calculate reward using adaptive sampling with difficulty adjustment
-                base_reward = self.trainer.reward_calculator.calculate_stockfish_reward(board, prev_board)
+                # Get current evaluation frequency (may be dynamic with hybrid approach)
+                current_freq = self.trainer.reward_calculator.get_current_frequency()
+
+                # Use Stockfish evaluation based on configured frequency
+                if random.random() < current_freq or done:
+                    # Always use Stockfish for terminal states, otherwise use based on frequency
+                    base_reward = self.trainer.reward_calculator.calculate_stockfish_reward(board, prev_board)
+                else:
+                    # Use faster material-based reward for other positions
+                    base_reward = self.trainer.reward_calculator.calculate_reward(board)
 
                 # Scale reward based on curriculum level for better learning progression
                 reward = base_reward * self._get_difficulty_factor(self.current_level)
