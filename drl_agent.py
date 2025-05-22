@@ -40,13 +40,18 @@ class SimplifiedAttention(nn.Module):
     """
     Simplified attention module for faster processing.
 
-    This is a minimal channel attention mechanism that focuses on
-    important piece types and their relationships.
+    This is a lightweight alternative to the full self-attention mechanism,
+    using spatial attention rather than the more computationally expensive
+    self-attention from transformer architectures.
     """
     def __init__(self, in_channels):
         super(SimplifiedAttention, self).__init__()
 
-        # Channel attention only - more efficient
+        # Spatial attention with fewer operations
+        self.conv_spatial = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.norm = nn.BatchNorm2d(in_channels)
+
+        # Channel attention
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.channel_attn = nn.Sequential(
             nn.Linear(in_channels, in_channels // 2),
@@ -59,13 +64,17 @@ class SimplifiedAttention(nn.Module):
         # Store residual
         residual = x
 
+        # Spatial attention - simpler than full self-attention
+        spatial = self.conv_spatial(x)
+        spatial = self.norm(spatial)
+
         # Channel attention
         b, c, _, _ = x.size()
         channel = self.avg_pool(x).view(b, c)
         channel = self.channel_attn(channel).view(b, c, 1, 1)
 
         # Apply attention
-        out = x * channel
+        out = spatial * channel
 
         # Add residual connection
         return out + residual
@@ -95,30 +104,51 @@ class ResidualBlock(nn.Module):
 
 class ChessFeatureExtractor(nn.Module):
     """
-    Minimal chess-specific feature extractor.
+    Simplified chess-specific feature extractor to encode domain knowledge.
 
-    This module provides a simple feature extraction layer with a residual connection.
+    This module extracts basic chess-specific features with reduced complexity:
+    - Center control
+    - King safety
+    - Basic piece mobility
     """
     def __init__(self, in_channels):
         super(ChessFeatureExtractor, self).__init__()
 
-        # Single convolutional layer for feature extraction
-        self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
-        self.bn = nn.BatchNorm2d(in_channels)
+        # Convolutional layers for feature extraction (reduced size)
+        self.conv1 = nn.Conv2d(in_channels, 16, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(16)
+
+        # Simplified specialized feature detectors
+        # Combined mobility and center control detector
+        self.mobility_center_conv = nn.Conv2d(16, 8, kernel_size=3, padding=1)
+
+        # King safety detector
+        self.king_safety_conv = nn.Conv2d(16, 8, kernel_size=3, padding=1)
+
+        # Final integration layer (reduced size)
+        self.integration_conv = nn.Conv2d(16, in_channels, kernel_size=1)
+        self.bn_out = nn.BatchNorm2d(in_channels)
 
     def forward(self, x):
-        # Store residual
-        residual = x
+        # Initial feature extraction
+        features = F.relu(self.bn1(self.conv1(x)))
 
-        # Extract features
-        features = F.relu(self.bn(self.conv(x)))
+        # Extract simplified specialized features
+        mobility_center = F.relu(self.mobility_center_conv(features))
+        king_safety = F.relu(self.king_safety_conv(features))
+
+        # Concatenate simplified features
+        combined_features = torch.cat([mobility_center, king_safety], dim=1)
+
+        # Integrate features
+        enhanced_features = F.relu(self.bn_out(self.integration_conv(combined_features)))
 
         # Residual connection
-        return features + residual
+        return enhanced_features + x
 
 class DQN(nn.Module):
     """
-    Simplified neural network for chess position evaluation with dual policy and value heads.
+    AlphaZero-style network for chess position evaluation with dual policy and value heads.
 
     Architecture:
     - Input: 16 channel 8x8 board representation
@@ -128,43 +158,45 @@ class DQN(nn.Module):
       * Channel 14: En passant
       * Channel 15: Player to move
 
-    - Simple feature extraction with a single convolutional layer
-    - 2 residual blocks for spatial feature extraction
-    - 1 simplified attention layer for focusing on important board areas
-    - 32 channels throughout the convolutional layers
+    - Chess-specific feature extraction for domain knowledge encoding
+    - Convolutional layers with residual connections extract spatial features
+    - Simplified attention mechanism for faster processing
+    - Reduced number of residual blocks (2 instead of 3)
+    - Reduced channel count (32 instead of 64) for faster computation
     - Dual output heads:
       * Policy head: 4096 move probabilities (64x64 possible from-to square combinations)
       * Value head: Single scalar value estimating position evaluation (-1 to 1)
 
-    The network uses batch normalization, residual connections, and ReLU activations
-    for training stability and performance.
+    The network uses batch normalization, residual connections, simplified attention,
+    and ReLU activations for better training stability and performance.
     """
-    def __init__(self):
+    def __init__(self, num_residual_blocks=2, channels=32, attention_layers=1):
         super(DQN, self).__init__()
 
-        # Network configuration - fixed to recommended values
-        self.num_residual_blocks = 2  # Fixed to 2 as per hyperparameters
-        self.channels = 32  # Fixed to 32 as per hyperparameters
+        # Network configuration
+        self.num_residual_blocks = num_residual_blocks
+        self.channels = channels
+        self.attention_layers = attention_layers
 
         # Initial convolutional layer
-        self.conv_in = nn.Conv2d(16, self.channels, kernel_size=3, stride=1, padding=1)
-        self.bn_in = nn.BatchNorm2d(self.channels)
+        self.conv_in = nn.Conv2d(16, channels, kernel_size=3, stride=1, padding=1)
+        self.bn_in = nn.BatchNorm2d(channels)
 
         # Chess-specific feature extractor
         self.chess_feature_extractor = ChessFeatureExtractor(16)
 
-        # Create residual blocks
+        # Create reduced number of residual blocks
         self.res_blocks = nn.ModuleList([
-            ResidualBlock(self.channels) for _ in range(self.num_residual_blocks)
+            ResidualBlock(channels) for _ in range(num_residual_blocks)
         ])
 
-        # Create single attention layer
+        # Create simplified attention layers
         self.attention_modules = nn.ModuleList([
-            SimplifiedAttention(self.channels)
+            SimplifiedAttention(channels) for _ in range(attention_layers)
         ])
 
         # Additional convolutional layer to increase feature maps
-        self.conv_out = nn.Conv2d(self.channels, 64, kernel_size=3, stride=1, padding=1)
+        self.conv_out = nn.Conv2d(channels, 64, kernel_size=3, stride=1, padding=1)
         self.bn_out = nn.BatchNorm2d(64)
 
         # Shared representation layer
@@ -189,13 +221,13 @@ class DQN(nn.Module):
         # Initial convolution
         x = F.relu(self.bn_in(self.conv_in(x)))
 
-        # Apply residual blocks with attention after the first block
+        # Apply residual blocks with interleaved attention
         for i, res_block in enumerate(self.res_blocks):
             x = res_block(x)
 
-            # Apply attention only after the first residual block
-            if i == 0:
-                x = self.attention_modules[0](x)
+            # Apply attention after some residual blocks
+            if i < len(self.attention_modules):
+                x = self.attention_modules[i](x)
 
         # Final convolution
         x = F.relu(self.bn_out(self.conv_out(x)))
@@ -289,7 +321,99 @@ def temperature_sampling(policy_probs, legal_moves, temperature=1.0):
     # Return the selected move index
     return legal_moves[selected_idx]
 
-# Lookahead function removed to simplify the codebase
+def simple_lookahead(board, policy_net, device, depth=1):
+    """
+    Perform a simple 1-2 ply lookahead for critical positions.
+
+    Args:
+        board (chess.Board): Current board position
+        policy_net (nn.Module): Policy network
+        device (torch.device): Device to run computations on
+        depth (int): Lookahead depth (1 or 2)
+
+    Returns:
+        int: Best move index after lookahead
+    """
+    # Check if this is a critical position (in check, or can capture a piece)
+    is_critical = board.is_check() or any(board.is_capture(move) for move in board.legal_moves)
+
+    if not is_critical or depth <= 0:
+        # For non-critical positions, just use the policy network directly
+        state = board_to_tensor(board, device)
+        mask = create_move_mask(board, device)
+
+        with torch.no_grad():
+            policy_logits, value = policy_net(state, mask)
+            return torch.argmax(policy_logits[0]).item()
+
+    # For critical positions, do a simple lookahead
+    # Use a very low value instead of -inf for FP16 compatibility
+    best_score = -1e4
+    best_move_idx = None
+
+    # Get legal moves
+    legal_moves = list(board.legal_moves)
+    legal_move_indices = [m.from_square * 64 + m.to_square for m in legal_moves]
+
+    # Evaluate each move with lookahead
+    for i, move in enumerate(legal_moves):
+        # Make the move
+        board_copy = board.copy()
+        board_copy.push(move)
+
+        if board_copy.is_checkmate():
+            # Immediate checkmate is best
+            return legal_move_indices[i]
+
+        if depth > 1 and not board_copy.is_game_over():
+            # Opponent's best response
+            opponent_state = board_to_tensor(board_copy, device)
+            opponent_mask = create_move_mask(board_copy, device)
+
+            with torch.no_grad():
+                # Only need policy logits for opponent's move selection
+                opponent_policy_logits, _ = policy_net(opponent_state, opponent_mask)
+
+                # Find opponent's best move
+                opponent_legal_moves = list(board_copy.legal_moves)
+                if opponent_legal_moves:
+                    opponent_legal_indices = [m.from_square * 64 + m.to_square for m in opponent_legal_moves]
+                    opponent_best_idx = torch.argmax(opponent_policy_logits[0, opponent_legal_indices]).item()
+                    opponent_best_move = opponent_legal_moves[opponent_best_idx]
+
+                    # Make opponent's move
+                    board_copy.push(opponent_best_move)
+
+                    if board_copy.is_checkmate():
+                        # If opponent can checkmate, this is a bad move
+                        # Use a very low value instead of -inf for FP16 compatibility
+                        score = -1e4
+                    else:
+                        # Evaluate resulting position
+                        result_state = board_to_tensor(board_copy, device)
+                        result_mask = create_move_mask(board_copy, device)
+
+                        with torch.no_grad():
+                            _, result_value = policy_net(result_state, result_mask)
+                            score = result_value.item()
+                else:
+                    # No legal moves for opponent (stalemate)
+                    score = 0.0
+        else:
+            # Evaluate position after our move
+            state = board_to_tensor(board_copy, device)
+            mask = create_move_mask(board_copy, device)
+
+            with torch.no_grad():
+                _, value = policy_net(state, mask)
+                score = value.item()
+
+        # Update best move
+        if score > best_score:
+            best_score = score
+            best_move_idx = legal_move_indices[i]
+
+    return best_move_idx
 
 # Helper function to convert chess board to tensor representation
 # Optimized version for better performance
@@ -393,9 +517,10 @@ class ChessAgent:
     only legal moves are selected. It includes repetition detection and avoidance
     to prevent the agent from making repetitive moves that could lead to draws.
 
-    Features:
-    - Simple temperature-based move selection for exploration
-    - Basic repetition handling with penalties
+    Enhanced features:
+    - Phase-aware exploration (opening, middlegame, endgame)
+    - Temperature-based move selection for controlled exploration
+    - Improved repetition handling with adaptive penalties
     """
     def __init__(self, model_path=None, repetition_penalty=0.95, use_fp16=True, temperature=1.0):
         """
@@ -483,8 +608,18 @@ class ChessAgent:
             state_tensor = board_to_tensor(board).to(self.device)
             move_mask = create_move_mask(board).to(self.device)
 
-            # Get policy logits from the network
-            policy_logits, _ = self.policy_net(state_tensor, move_mask)
+            # Use FP16 precision for inference if enabled
+            if self.use_fp16:
+                # Import autocast for mixed precision inference
+                from torch.amp import autocast
+
+                # Use autocast for mixed precision inference
+                with autocast(device_type='cuda'):
+                    # No need to manually convert to fp16, autocast handles this
+                    policy_logits, value = self.policy_net(state_tensor, move_mask)
+            else:
+                # Standard full precision inference
+                policy_logits, value = self.policy_net(state_tensor, move_mask)
 
             # Print some stats about the policy_logits to help debug
             if torch.isnan(policy_logits).any():
@@ -499,12 +634,19 @@ class ChessAgent:
             # Get the adjusted policy logits for legal moves only
             legal_adjusted_policy_logits = adjusted_policy_logits[0, legal_move_indices]
 
-            # Apply simple temperature scaling
-            if self.temperature != 1.0:
-                legal_adjusted_policy_logits = legal_adjusted_policy_logits / self.temperature
+            # Determine game phase for phase-aware exploration
+            game_phase = self._determine_game_phase(board)
 
-            # Simple exploration strategy - 20% random sampling, 80% greedy
-            use_sampling = random.random() < 0.2
+            # Apply temperature-based selection with phase-aware adjustments
+            temperature = self._get_phase_adjusted_temperature(game_phase)
+
+            # Apply temperature to policy logits (higher temperature = more exploration)
+            if temperature != 1.0:
+                # Apply softmax with temperature
+                legal_adjusted_policy_logits = legal_adjusted_policy_logits / temperature
+
+            # Decide whether to use softmax sampling or greedy selection
+            use_sampling = random.random() < self._get_phase_exploration_rate(game_phase)
 
             if use_sampling and len(legal_move_indices) > 1:
                 # Apply softmax to get probabilities
@@ -547,7 +689,79 @@ class ChessAgent:
                 self._update_position_history(board, random_move)
                 return random_move
 
-    # Game phase methods removed to simplify the codebase
+    def _determine_game_phase(self, board):
+        """
+        Determine the current phase of the game: opening, middlegame, or endgame.
+
+        Args:
+            board (chess.Board): The current chess position
+
+        Returns:
+            str: Game phase - 'opening', 'middlegame', or 'endgame'
+        """
+        # Count the total number of pieces
+        piece_count = len(board.piece_map())
+
+        # Count the number of moves played
+        move_count = board.fullmove_number
+
+        # Check if queens are still on the board
+        has_queens = (board.pieces(chess.QUEEN, chess.WHITE) or
+                     board.pieces(chess.QUEEN, chess.BLACK))
+
+        # Opening: First 10 moves with most pieces still on board
+        if move_count <= 10 and piece_count >= 28:
+            return 'opening'
+        # Endgame: Few pieces left or no queens
+        elif piece_count <= 12 or not has_queens:
+            return 'endgame'
+        # Middlegame: Everything else
+        else:
+            return 'middlegame'
+
+    def _get_phase_adjusted_temperature(self, game_phase):
+        """
+        Get temperature parameter adjusted for the current game phase.
+
+        Args:
+            game_phase (str): Current game phase
+
+        Returns:
+            float: Adjusted temperature value
+        """
+        base_temperature = self.temperature
+
+        # Adjust temperature based on game phase
+        if game_phase == 'opening':
+            # More exploration in opening
+            return base_temperature * 1.2
+        elif game_phase == 'endgame':
+            # Less exploration in endgame
+            return base_temperature * 0.8
+        else:
+            # Standard temperature for middlegame
+            return base_temperature
+
+    def _get_phase_exploration_rate(self, game_phase):
+        """
+        Get exploration rate based on the current game phase.
+
+        Args:
+            game_phase (str): Current game phase
+
+        Returns:
+            float: Exploration rate (0-1)
+        """
+        # Base exploration rates for different phases
+        if game_phase == 'opening':
+            # Higher exploration in opening to try different openings
+            return 0.35  # Increased for more opening variety
+        elif game_phase == 'middlegame':
+            # Moderate exploration in middlegame
+            return 0.20  # Slightly increased for better tactical exploration
+        else:  # endgame
+            # Lower exploration in endgame for more precise play
+            return 0.08  # Slightly increased but still low for endgame precision
 
     def _apply_repetition_penalties(self, board, policy_logits):
         """
