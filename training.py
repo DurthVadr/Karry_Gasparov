@@ -560,6 +560,7 @@ class SelfPlayTrainer:
 
         # Initialize model pool for diverse opponents
         model_pool = []
+        model_pool_metadata = []
         model_dir = self.trainer.model_dir
 
         # Initialize curriculum tracking
@@ -578,23 +579,27 @@ class SelfPlayTrainer:
         existing_models = [f for f in os.listdir(model_dir) if f.endswith('.pt') and 'model_pool' in f]
         if existing_models:
             print(f"Found {len(existing_models)} existing models to add to the model pool")
+            max_pool_size = self.trainer.hyperparams['curriculum']['max_pool_size']
             for model_file in existing_models[:max_pool_size]:  # Limit to max pool size
                 try:
                     model_path = os.path.join(model_dir, model_file)
                     model_copy = DQN()
                     model_copy.load_state_dict(torch.load(model_path, map_location=self.trainer.device))
-                    model_pool.append(model_copy)
-
-                    # Extract episode number from filename
+                    
                     episode_num = int(model_file.split('_')[-1].split('.')[0])
+
+                    # Only append if all above succeeds
+                    model_pool.append(model_copy)
                     model_pool_metadata.append({
                         'episode': episode_num,
                         'path': model_path,
                         'level': 1  # Default level
                     })
                     print(f"Added {model_file} to model pool")
+
                 except Exception as e:
                     print(f"Error loading model {model_file}: {e}")
+
 
             print(f"Successfully loaded {len(model_pool)} models into the pool")
 
@@ -647,6 +652,7 @@ class SelfPlayTrainer:
                 # Select a model from the pool based on curriculum level
                 opponent_model = self._select_appropriate_pool_model(model_pool, model_pool_metadata, effective_level)
                 opponent_model.eval()  # Set to evaluation mode
+                opponent_model.to(self.trainer.device)
                 use_model_pool = True
             elif opponent_type == 'random':
                 use_random_moves = True

@@ -13,6 +13,8 @@ import chess
 import chess.engine
 import chess.pgn
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Use a non-GUI backend for plotting
 import matplotlib.pyplot as plt
 from drl_agent import ChessAgent
 from evaluation import ModelEvaluator

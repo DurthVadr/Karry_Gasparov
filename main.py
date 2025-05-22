@@ -21,7 +21,7 @@ import argparse
 
 # Import torch.amp for mixed precision training
 from torch.amp import GradScaler
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 
 # Import custom modules
 from drl_agent import DQN
@@ -187,7 +187,7 @@ class ChessTrainer:
         return self.pgn_trainer.train_from_pgn(pgn_path, num_games, batch_size, save_interval)
 
     def train_self_play(self, num_episodes=5000, stockfish_levels=None,
-                      batch_size=64, save_interval=100, eval_interval=1000, target_level=7):
+                      batch_size=128, save_interval=100, eval_interval=1000, target_level=7):
         """
         Train the model using pure self-play (model vs itself and model pool).
 
@@ -440,7 +440,7 @@ class ChessTrainer:
                 next_state_batch_fp16 = next_state_batch.to(dtype=torch.float16)
                 next_mask_batch_fp16 = next_mask_batch.to(dtype=torch.float16)
 
-                with autocast('cuda'):
+                with autocast(device_type='cuda'):
                     # Forward pass with FP16 tensors
                     state_action_values = self.policy_net(state_batch_fp16, mask_batch_fp16).gather(1, action_batch)
 
@@ -452,7 +452,7 @@ class ChessTrainer:
                         next_state_values[done_batch] = 0.0
             else:
                 # Use autocast without explicit conversion
-                with autocast('cuda'):
+                with autocast(device_type='cuda'):
                     state_action_values = self.policy_net(state_batch, mask_batch).gather(1, action_batch)
 
                     # Compute V(s_{t+1}) for all next states
@@ -560,7 +560,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train chess model with optimized performance")
     parser.add_argument("--data_dir", default="data", help="Directory containing PGN files")
     parser.add_argument("--num_games", type=int, default=100, help="Maximum number of games to process")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
+    parser.add_argument("--batch_size", type=int, default=128, help="Batch size for training")
     parser.add_argument("--save_interval", type=int, default=100, help="How often to save the model (in games)")
     parser.add_argument("--self_play", action="store_true", help="Run self-play training after PGN training")
     parser.add_argument("--self_play_episodes", type=int, default=1000, help="Number of self-play episodes")

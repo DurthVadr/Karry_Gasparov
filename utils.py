@@ -4,6 +4,8 @@ Utility functions for chess reinforcement learning.
 
 import os
 import torch
+import matplotlib
+matplotlib.use('Agg')  # Use a non-GUI backend for plotting
 import matplotlib.pyplot as plt
 import numpy as np
 import chess

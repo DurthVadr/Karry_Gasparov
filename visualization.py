@@ -5,6 +5,8 @@ This module provides functions for visualizing training progress and model perfo
 """
 
 import os
+import matplotlib
+matplotlib.use('Agg')  # Use a non-GUI backend for plotting
 import matplotlib.pyplot as plt
 
 def plot_training_progress(training_stats, output_path=None):

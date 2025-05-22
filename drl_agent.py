@@ -404,7 +404,8 @@ class ChessAgent:
             try:
                 print(f"ChessAgent: Loading model from {model_path}")
                 # Try to load with map_location to handle models trained on different devices
-                self.policy_net.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+                self.policy_net.load_state_dict(torch.load(model_path, map_location=self.device))
+                self.policy_net.to(self.device)
                 print(f"ChessAgent: Successfully loaded model from {model_path}")
                 self.model_loaded = True
             except Exception as e:
@@ -469,7 +470,7 @@ class ChessAgent:
                 move_mask_fp16 = move_mask.to(dtype=torch.float16)
 
                 # Use autocast for mixed precision inference
-                with autocast():
+                with autocast(device_type='cuda'):
                     q_values = self.policy_net(state_tensor_fp16, move_mask_fp16)
             else:
                 # Standard full precision inference
