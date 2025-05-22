@@ -24,6 +24,8 @@ OPTIMIZER_CONFIG = {
     'weight_decay': 1e-4,           # L2 regularization factor
     'gradient_clip': 5.0,           # Gradient clipping threshold
     'batch_size': 256,              # Batch size for training (increased for better GPU utilization)
+    'accumulation_steps': 4,        # Number of batches to accumulate gradients over (effective batch size = batch_size * accumulation_steps)
+    'use_gradient_accumulation': True, # Whether to use gradient accumulation
 }
 
 # Experience Replay Parameters
@@ -65,7 +67,8 @@ CURRICULUM_CONFIG = {
 # Self-Play Parameters
 SELF_PLAY_CONFIG = {
     'num_episodes': 10000,          # Number of self-play episodes
-    'max_moves': 300,               # Maximum moves per game
+    'max_moves': 250,               # Maximum moves per game (reduced from 300 for efficiency)
+    'early_stopping_no_progress': 30, # Stop game if no material change in this many moves
     'eval_interval': 500,           # Interval between evaluations
     'save_interval': 1000,          # Interval between saving models
     'target_update': 500,           # Interval between target network updates (reduced from 1000)
@@ -74,10 +77,11 @@ SELF_PLAY_CONFIG = {
 
 # Asynchronous Evaluation Parameters
 ASYNC_EVAL_CONFIG = {
-    'num_workers': 4,               # Number of worker threads for async evaluation
-    'cache_size': 10000,            # Size of evaluation cache
+    'num_workers': 8,               # Number of worker threads for async evaluation (increased from 4)
+    'cache_size': 20000,            # Size of evaluation cache (increased from 10000)
     'default_depth': 12,            # Default evaluation depth
     'critical_depth': 16,           # Depth for critical positions
+    'enable_prefetch': True,        # Enable prefetching of evaluations
 }
 
 # Mixed Precision Parameters
@@ -132,14 +136,24 @@ def get_optimized_hyperparameters(gpu_type=None):
         # Increase batch size for better GPU utilization
         config['optimizer']['batch_size'] = 256
 
+        # Enable gradient accumulation for effective larger batches
+        config['optimizer']['use_gradient_accumulation'] = True
+        config['optimizer']['accumulation_steps'] = 4
+
         # Enable mixed precision
         config['mixed_precision']['enabled'] = True
 
         # Increase number of workers for async evaluation
-        config['async_eval']['num_workers'] = 6
+        config['async_eval']['num_workers'] = 8
+        config['async_eval']['enable_prefetch'] = True
+        config['async_eval']['cache_size'] = 20000
 
         # Optimize network architecture
         config['network']['channels'] = 128
         config['network']['fc_hidden_size'] = 4096
+
+        # Reduce max moves per game for efficiency
+        config['self_play']['max_moves'] = 250
+        config['self_play']['early_stopping_no_progress'] = 30
 
     return config

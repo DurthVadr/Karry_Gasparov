@@ -19,16 +19,18 @@ class ModelEvaluator:
     chess models against Stockfish at various skill levels.
     """
 
-    def __init__(self, stockfish_path=None, use_fp16=True):
+    def __init__(self, stockfish_path=None, use_fp16=True, trainer=None):
         """
         Initialize the model evaluator.
 
         Args:
             stockfish_path (str, optional): Path to Stockfish executable
             use_fp16 (bool, optional): Whether to use FP16 precision for model inference
+            trainer (ChessTrainer, optional): Reference to the trainer for accessing hyperparameters
         """
         self.stockfish_path = stockfish_path
         self.stockfish = None
+        self.trainer = trainer  # Store reference to trainer for accessing hyperparameters
 
         # Set up mixed precision evaluation
         self.use_fp16 = use_fp16 and torch.cuda.is_available()
@@ -44,19 +46,24 @@ class ModelEvaluator:
                 print(f"Error initializing Stockfish engine: {e}")
                 print("Model evaluation against Stockfish will not be available")
 
-    def evaluate_against_stockfish(self, model_path, num_games=10, max_moves=100, stockfish_levels=range(1, 11)):
+    def evaluate_against_stockfish(self, model_path, num_games=10, max_moves=None, stockfish_levels=range(1, 11)):
         """
         Evaluate a trained model against different Stockfish levels.
 
         Args:
             model_path (str): Path to the model file to evaluate
             num_games (int): Number of games to play against each Stockfish level
-            max_moves (int): Maximum number of moves per game
+            max_moves (int, optional): Maximum number of moves per game. If None, uses the value from trainer's hyperparameters.
             stockfish_levels (range or list): Range of Stockfish levels to test against
 
         Returns:
             dict: Dictionary with results for each Stockfish level
         """
+        # Use max_moves from trainer's hyperparameters if not specified
+        if max_moves is None and hasattr(self, 'trainer') and hasattr(self.trainer, 'max_moves'):
+            max_moves = self.trainer.max_moves
+        elif max_moves is None:
+            max_moves = 250  # Default fallback
         # Load the model to evaluate
         if not os.path.exists(model_path):
             print(f"Model file {model_path} not found")

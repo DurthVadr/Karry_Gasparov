@@ -217,10 +217,32 @@ class PGNTrainer:
 
                         # Perform optimization if enough samples
                         if len(self.trainer.memory) >= self.trainer.batch_size:
-                            loss = self.trainer.optimize_model()
-                            if loss is not None:
-                                losses.append(loss)
-                                optimization_steps += 1
+                            # Use gradient accumulation if enabled
+                            if self.trainer.use_gradient_accumulation:
+                                # Determine which accumulation step we're on
+                                current_step = optimization_steps % self.trainer.accumulation_steps
+
+                                # Perform optimization with gradient accumulation
+                                loss = self.trainer.optimize_model(
+                                    accumulate_gradients=True,
+                                    accumulation_steps=self.trainer.accumulation_steps,
+                                    current_step=current_step
+                                )
+
+                                # Only count as a full optimization step at the end of accumulation
+                                if current_step == self.trainer.accumulation_steps - 1:
+                                    if loss is not None:
+                                        losses.append(loss)
+                                    optimization_steps += 1
+                                elif loss is not None:
+                                    # Still track loss for intermediate steps
+                                    losses.append(loss)
+                            else:
+                                # Standard optimization without gradient accumulation
+                                loss = self.trainer.optimize_model()
+                                if loss is not None:
+                                    losses.append(loss)
+                                    optimization_steps += 1
 
                     game_count += 1
 
@@ -501,6 +523,36 @@ class SelfPlayTrainer:
             print(f"Move quality evaluation failed: {e}")
             return 0.5
 
+    def _count_material(self, board):
+        """
+        Count the total material on the board.
+
+        Args:
+            board (chess.Board): The current board position
+
+        Returns:
+            int: Total material count (pawns=1, knights/bishops=3, rooks=5, queens=9)
+        """
+        piece_values = {
+            chess.PAWN: 1,
+            chess.KNIGHT: 3,
+            chess.BISHOP: 3,
+            chess.ROOK: 5,
+            chess.QUEEN: 9,
+            chess.KING: 0  # Kings don't count for material change detection
+        }
+
+        total_material = 0
+        for piece_type in piece_values:
+            # Count white pieces
+            white_pieces = len(board.pieces(piece_type, chess.WHITE))
+            # Count black pieces
+            black_pieces = len(board.pieces(piece_type, chess.BLACK))
+            # Add to total
+            total_material += (white_pieces + black_pieces) * piece_values[piece_type]
+
+        return total_material
+
     def _get_difficulty_factor(self, level):
         """
         Get the difficulty scaling factor for the current level.
@@ -672,6 +724,10 @@ class SelfPlayTrainer:
             experiences = []  # Collect experiences for batch processing
             move_qualities = []  # Track quality of moves for game quality assessment
 
+            # Track material for early stopping due to no progress
+            last_material_change_move = 0
+            last_material_count = self._count_material(board)
+
             # Play the game
             done = False
             while not done:
@@ -745,8 +801,21 @@ class SelfPlayTrainer:
                 episode_length += 1
                 total_positions += 1
 
-                # End game if it's too long
-                if episode_length >= 300:
+                # Check material for early stopping due to no progress
+                current_material = self._count_material(board)
+                if current_material != last_material_count:
+                    # Material changed, update tracking
+                    last_material_count = current_material
+                    last_material_change_move = episode_length
+                elif episode_length - last_material_change_move >= self.trainer.early_stopping_no_progress:
+                    # No material change for too many moves, end the game
+                    print(f"Early stopping: No material change for {episode_length - last_material_change_move} moves")
+                    done = True
+                    reward -= 0.2  # Small penalty for no progress
+
+                # End game if it's too long (reduced from 300 to max_moves from hyperparameters)
+                if episode_length >= self.trainer.max_moves:
+                    print(f"Game ended due to reaching maximum moves: {episode_length}")
                     done = True
 
             # Process experiences in batches
@@ -759,10 +828,32 @@ class SelfPlayTrainer:
 
                 # Perform optimization if enough samples
                 if len(self.trainer.memory) >= self.trainer.batch_size:
-                    loss = self.trainer.optimize_model()
-                    if loss is not None:
-                        self.trainer.training_stats['losses'].append(loss)
-                        total_optimization_steps += 1
+                    # Use gradient accumulation if enabled
+                    if self.trainer.use_gradient_accumulation:
+                        # Determine which accumulation step we're on
+                        current_step = total_optimization_steps % self.trainer.accumulation_steps
+
+                        # Perform optimization with gradient accumulation
+                        loss = self.trainer.optimize_model(
+                            accumulate_gradients=True,
+                            accumulation_steps=self.trainer.accumulation_steps,
+                            current_step=current_step
+                        )
+
+                        # Only count as a full optimization step at the end of accumulation
+                        if current_step == self.trainer.accumulation_steps - 1:
+                            if loss is not None:
+                                self.trainer.training_stats['losses'].append(loss)
+                            total_optimization_steps += 1
+                        elif loss is not None:
+                            # Still track loss for intermediate steps
+                            self.trainer.training_stats['losses'].append(loss)
+                    else:
+                        # Standard optimization without gradient accumulation
+                        loss = self.trainer.optimize_model()
+                        if loss is not None:
+                            self.trainer.training_stats['losses'].append(loss)
+                            total_optimization_steps += 1
 
             # Update target network periodically
             if total_optimization_steps > 0 and total_optimization_steps % self.trainer.target_update == 0:

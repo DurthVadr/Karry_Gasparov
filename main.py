@@ -136,10 +136,11 @@ class ChessTrainer:
             num_workers=8  # Use 8 worker threads for parallel evaluation
         )
 
-        # Initialize model evaluator
+        # Initialize model evaluator with reference to this trainer
         self.model_evaluator = ModelEvaluator(
             stockfish_path=stockfish_path,
-            use_fp16=self.fp16_enabled
+            use_fp16=self.fp16_enabled,
+            trainer=self  # Pass reference to trainer for accessing hyperparameters
         )
 
         # Initialize simple metrics for on-the-fly monitoring
@@ -159,6 +160,14 @@ class ChessTrainer:
 
         # Set gradient clipping threshold from hyperparameters
         self.gradient_clip = self.hyperparams['optimizer']['gradient_clip']
+
+        # Gradient accumulation parameters
+        self.use_gradient_accumulation = self.hyperparams['optimizer'].get('use_gradient_accumulation', False)
+        self.accumulation_steps = self.hyperparams['optimizer'].get('accumulation_steps', 1)
+
+        # Early stopping parameters for games
+        self.max_moves = self.hyperparams['self_play']['max_moves']
+        self.early_stopping_no_progress = self.hyperparams['self_play'].get('early_stopping_no_progress', 30)
 
         # Initialize step counter
         self.steps_done = 0
@@ -408,7 +417,7 @@ class ChessTrainer:
 
         return action_idx, move
 
-    def optimize_model(self):
+    def optimize_model(self, accumulate_gradients=False, accumulation_steps=1, current_step=0):
         """
         Perform one step of optimization with prioritized experience replay.
 
@@ -419,12 +428,22 @@ class ChessTrainer:
         2. Q-value clipping to range [-10, 10] to prevent drift
         3. Target network updates every 500 episodes
         4. Prioritized experience replay for better sample efficiency
+        5. Gradient accumulation for effective larger batch sizes
+
+        Args:
+            accumulate_gradients (bool): Whether to accumulate gradients across multiple batches
+            accumulation_steps (int): Number of batches to accumulate gradients over
+            current_step (int): Current accumulation step (0-indexed)
 
         Returns:
             float: Loss value if optimization was performed, None otherwise
         """
         if len(self.memory) < self.batch_size:
             return None
+
+        # Only zero gradients at the start of accumulation
+        if not accumulate_gradients or current_step == 0:
+            self.optimizer.zero_grad()
 
         # Sample a batch from prioritized memory
         experiences, indices, weights = self.memory.sample(self.batch_size)
@@ -534,31 +553,46 @@ class ChessTrainer:
         elementwise_loss = criterion(state_action_values, expected_state_action_values.unsqueeze(1))
         loss = (elementwise_loss * weights.unsqueeze(1)).mean()
 
-        # Optimize the model with mixed precision if available
-        self.optimizer.zero_grad()
+        # Scale loss by accumulation steps if accumulating gradients
+        if accumulate_gradients:
+            loss = loss / accumulation_steps
 
         if self.use_mixed_precision:
             # Use mixed precision training
             self.scaler.scale(loss).backward()
 
-            # Improved gradient clipping for better stability with mixed precision
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), self.gradient_clip)
+            # Only update weights at the end of accumulation
+            if not accumulate_gradients or current_step == accumulation_steps - 1:
+                # Improved gradient clipping for better stability with mixed precision
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), self.gradient_clip)
 
-            # Update weights with scaled gradients
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+                # Update weights with scaled gradients
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+
+                # Update learning rate if scheduler is defined
+                if self.scheduler is not None:
+                    self.scheduler.step()
         else:
             # Standard full precision training
             loss.backward()
 
-            # Improved gradient clipping for better stability
-            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), self.gradient_clip)
+            # Only update weights at the end of accumulation
+            if not accumulate_gradients or current_step == accumulation_steps - 1:
+                # Improved gradient clipping for better stability
+                torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), self.gradient_clip)
+                self.optimizer.step()
 
-            self.optimizer.step()
+                # Update learning rate if scheduler is defined
+                if self.scheduler is not None:
+                    self.scheduler.step()
 
         # Update simple metrics
         loss_value = loss.item()
+        if accumulate_gradients:
+            loss_value *= accumulation_steps  # Scale back for reporting
+
         self.metrics.update_loss(loss_value)
 
         # Update Q-value metrics if available
